@@ -1,0 +1,82 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.installed.cfg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# --- Виртуальные окружения ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Poetry / pip ---
+poetry.lock
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- IDE / редакторы ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# --- Данные (тяжёлые, кэшируемые, регенерируемые) ---
+data/raw/
+data/processed/
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# --- Артефакты модели ---
+checkpoints/*
+!checkpoints/.gitkeep
+
+# --- Runtime артефакты бэктеста (генерируются 04_backtest.py) ---
+data/processed/runtime/
+
+# --- Логи ---
+*.log
+logs/
+
+# --- Секреты ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# --- Google Colab / Drive ---
+.colab/
+*.colab
+
+# --- OS ---
+.DS_Store
+desktop.ini

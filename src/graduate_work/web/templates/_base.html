@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>{% block title %}Trading Dashboard{% endblock %}</title>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+    <style>
+        body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+               margin: 0; background: #f7f8fa; color: #222; }
+        header { background: #1f2a44; color: #fff; padding: 14px 24px;
+                 display: flex; align-items: center; gap: 24px; }
+        header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+        nav a { color: #cbd6f0; text-decoration: none; margin-right: 16px;
+                font-size: 14px; }
+        nav a.active, nav a:hover { color: #fff; border-bottom: 2px solid #fff;
+                                    padding-bottom: 2px; }
+        main { padding: 20px 24px; max-width: 1320px; margin: 0 auto; }
+        .row { display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 24px; }
+        .card { background: #fff; border-radius: 10px; padding: 16px;
+                box-shadow: 0 1px 4px rgba(0,0,0,.06); flex: 1 1 480px; }
+        .card h2 { font-size: 16px; margin: 0 0 12px; font-weight: 600; }
+        .meta-line { color: #888; font-size: 12px; margin-top: 4px; }
+        button { font-size: 14px; padding: 6px 12px; border-radius: 6px;
+                 border: 1px solid #ccc; background: #fff; cursor: pointer; }
+        button:hover { background: #f0f3ff; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { padding: 6px 8px; text-align: left;
+                 border-bottom: 1px solid #eee; }
+        th { background: #fafbff; font-weight: 600; }
+        .metrics { display: grid; grid-template-columns: repeat(2, 1fr);
+                   gap: 8px 20px; font-size: 13px; }
+        .metrics dt { color: #555; }
+        .metrics dd { margin: 0; font-weight: 600; }
+        {% block extra_style %}{% endblock %}
+    </style>
+</head>
+<body>
+<header>
+    <h1>ВКР: алгоритмический трейдинг</h1>
+    <nav>
+        <a href="/" class="{% if request.url.path == '/' %}active{% endif %}">Live-прогнозы</a>
+        <a href="/report" class="{% if request.url.path == '/report' %}active{% endif %}">Отчёт о тестировании</a>
+    </nav>
+</header>
+<main>
+    {% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,42 @@
+[project]
+name = "graduate-work"
+version = "0.1.0"
+description = "ВКР: инструмент алгоритмической торговли на базе 1D-CNN + LSTM с MC Dropout"
+authors = [
+    {name = "Pozdnyakov Vasiliy", email = "lastviliam@gmail.com"},
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy>=1.26,<2.3",
+    "pandas>=2.1",
+    "pyarrow>=15.0",
+    "scikit-learn>=1.4",
+    "torch>=2.2",
+    "requests>=2.31",
+    "yfinance>=0.2.40",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "plotly>=5.20",
+    "pydantic>=2.6",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[tool.poetry]
+package-mode = true
+packages = [{include = "graduate_work", from = "src"}]
+
+[build-system]
+requires = ["poetry-core>=1.8"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

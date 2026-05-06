@@ -1,0 +1,148 @@
+{% extends "_base.html" %}
+{% block title %}Live-прогнозы | Trading Dashboard{% endblock %}
+
+{% block extra_style %}
+.cards-grid { display: grid; gap: 14px;
+              grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.tcard { background: #fff; border-radius: 10px; padding: 14px;
+         box-shadow: 0 1px 4px rgba(0,0,0,.06); position: relative; }
+.tcard.alert { border: 2px solid #2ca02c; }
+.tcard h3 { margin: 0 0 4px; font-size: 16px; }
+.tcard .price { color: #555; font-size: 13px; margin-bottom: 8px; }
+.tcard .badge { position: absolute; top: 10px; right: 10px;
+                background: #2ca02c; color: #fff; padding: 2px 8px;
+                border-radius: 12px; font-size: 11px; font-weight: 600; }
+.tcard .badge.hold { background: #999; }
+.tcard .er { font-size: 22px; font-weight: 700; }
+.tcard .er.pos { color: #1d8348; }
+.tcard .er.neg { color: #b00020; }
+.tcard .unc { color: #555; font-size: 12px; margin-top: 2px; }
+.tcard .ci-bar { position: relative; height: 10px; background: #f1f3f8;
+                 border-radius: 5px; margin: 8px 0; overflow: hidden; }
+.tcard .ci-bar .ci-fill { position: absolute; top: 0; bottom: 0;
+                          background: rgba(76,114,176,.45); }
+.tcard .ci-bar .ci-mean { position: absolute; top: -2px; bottom: -2px;
+                          width: 2px; background: #1f2a44; }
+.tcard .horizons { font-size: 11px; color: #777; margin-top: 6px; }
+.toolbar { display: flex; gap: 12px; align-items: center;
+           margin-bottom: 16px; flex-wrap: wrap; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%;
+              background: #2ca02c; display: inline-block; margin-right: 4px; }
+.status-dot.bad { background: #d62728; }
+{% endblock %}
+
+{% block content %}
+<div class="toolbar">
+    <button id="refresh-btn">Обновить сейчас</button>
+    <span><span class="status-dot {% if not service_ready %}bad{% endif %}"></span>
+        {% if service_ready %}модель загружена{% else %}модель не загружена (нет артефакта){% endif %}
+    </span>
+    {% if training_date %}<span class="meta-line">обучена: {{ training_date }}</span>{% endif %}
+    {% if horizons %}<span class="meta-line">горизонты: {{ horizons|join(', ') }} дн.</span>{% endif %}
+    <span id="last-update" class="meta-line"></span>
+</div>
+
+<div class="row">
+    <div class="card" style="flex: 1 1 100%;">
+        <h2>Активные алерты</h2>
+        <div id="alerts-block" class="cards-grid"></div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="card" style="flex: 1 1 100%;">
+        <h2>Прогнозы по всем тикерам ({{ tickers|length }})</h2>
+        <div id="forecast-grid" class="cards-grid"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function fetchJSON(url, options = {}) {
+    const r = await fetch(url, options);
+    if (!r.ok) {
+        const text = await r.text();
+        throw new Error(`${url}: ${r.status} ${text}`);
+    }
+    return r.json();
+}
+
+function renderCard(f, isAlert) {
+    const erClass = f.expected_return >= 0 ? 'pos' : 'neg';
+    const erPct = (f.expected_return * 100).toFixed(3);
+    const uncPct = (f.uncertainty * 100).toFixed(3);
+    const strength = f.alert_strength.toFixed(2);
+    const horizonsText = f.all_horizons.map(h =>
+        `h=${h.horizon}: ${(h.mean * 100).toFixed(2)}% ± ${(h.std * 100).toFixed(2)}%`
+    ).join(' · ');
+
+    // Простая визуализация CI: bar в диапазоне ±2*std вокруг mean.
+    const span = 4 * f.uncertainty || 0.001;
+    const lo = f.expected_return - 2 * f.uncertainty;
+    const meanPos = ((f.expected_return - lo) / span) * 100;
+
+    return `
+        <div class="tcard ${isAlert ? 'alert' : ''}">
+            ${isAlert
+                ? '<span class="badge">ALERT</span>'
+                : '<span class="badge hold">HOLD</span>'}
+            <h3>${f.ticker}</h3>
+            <div class="price">close: ${f.last_close.toFixed(2)} RUB · ${f.timestamp.slice(0, 10)}</div>
+            <div class="er ${erClass}">${erPct}% / день</div>
+            <div class="unc">std ${uncPct}% · SNR ${strength} · h=${f.best_horizon}</div>
+            <div class="ci-bar">
+                <div class="ci-fill" style="left: 25%; width: 50%;"></div>
+                <div class="ci-mean" style="left: ${meanPos.toFixed(1)}%;"></div>
+            </div>
+            <div class="horizons">${horizonsText}</div>
+        </div>`;
+}
+
+async function loadPredictions() {
+    try {
+        const data = await fetchJSON('/api/live/predictions');
+        const grid = document.getElementById('forecast-grid');
+        grid.innerHTML = data.forecasts.map(f => renderCard(f, f.alert)).join('');
+        const cachedAt = data.cached_at
+            ? new Date(data.cached_at * 1000).toLocaleTimeString()
+            : '—';
+        document.getElementById('last-update').textContent = `обновлено: ${cachedAt}`;
+    } catch (e) {
+        document.getElementById('forecast-grid').innerHTML =
+            `<div class="meta-line">Ошибка: ${e.message}</div>`;
+    }
+}
+
+async function loadAlerts() {
+    try {
+        const data = await fetchJSON('/api/live/alerts');
+        const block = document.getElementById('alerts-block');
+        if (!data.alerts || data.alerts.length === 0) {
+            block.innerHTML = '<div class="meta-line">Активных алертов нет.</div>';
+            return;
+        }
+        block.innerHTML = data.alerts.map(f => renderCard(f, true)).join('');
+    } catch (e) {
+        document.getElementById('alerts-block').innerHTML =
+            `<div class="meta-line">Ошибка: ${e.message}</div>`;
+    }
+}
+
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+    await fetchJSON('/api/live/refresh', { method: 'POST' });
+    await loadPredictions();
+    await loadAlerts();
+});
+
+(async () => {
+    await loadPredictions();
+    await loadAlerts();
+    // Авто-обновление каждые 60 секунд (бэкенд вернёт кэш если ещё свежий).
+    setInterval(async () => {
+        await loadPredictions();
+        await loadAlerts();
+    }, 60_000);
+})();
+</script>
+{% endblock %}

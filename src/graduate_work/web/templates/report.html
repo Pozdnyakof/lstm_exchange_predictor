@@ -1,0 +1,123 @@
+{% extends "_base.html" %}
+{% block title %}Отчёт о тестировании | Trading Dashboard{% endblock %}
+
+{% block extra_style %}
+.significance { padding: 8px 12px; border-radius: 6px; font-size: 13px;
+                margin-top: 12px; }
+.sig-ok { background: #e8f6ec; color: #1d8348; }
+.sig-no { background: #fdecea; color: #b00020; }
+{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="card" style="flex: 1 1 100%;">
+        <h2>Aggregate бэктест</h2>
+        <div id="equity-chart" style="height: 360px;"></div>
+        <dl class="metrics" id="metrics"></dl>
+    </div>
+</div>
+
+<div class="row">
+    <div class="card" style="flex: 1 1 100%;">
+        <h2>Per-ticker бэктест</h2>
+        <div id="per-ticker-chart" style="height: 320px;"></div>
+        <div style="max-height: 320px; overflow-y: auto; margin-top: 12px;">
+            <table>
+                <thead><tr id="pt-head"></tr></thead>
+                <tbody id="pt-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="card" style="flex: 1 1 100%;">
+        <h2>Random monkeys (3σ-критерий, §3.4)</h2>
+        <div id="random-chart" style="height: 320px;"></div>
+        <div id="sig-block"></div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function fetchJSON(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${url}: ${r.status}`);
+    return r.json();
+}
+
+const METRIC_LABELS = {
+    sharpe: 'Sharpe',
+    max_drawdown: 'Max DD',
+    win_rate: 'Win-rate',
+    profit_factor: 'Profit factor',
+    total_return: 'Total return',
+    annualized_return: 'Annualized',
+    n_trades: 'Trades',
+    final_equity: 'Final equity',
+};
+
+async function loadBacktest() {
+    const data = await fetchJSON('/api/report/backtest');
+    if (data.figure) {
+        Plotly.newPlot('equity-chart', data.figure.data, data.figure.layout, {responsive: true});
+    }
+    const dl = document.getElementById('metrics');
+    dl.innerHTML = '';
+    for (const [k, v] of Object.entries(data.metrics || {})) {
+        const dt = document.createElement('dt'); dt.textContent = METRIC_LABELS[k] || k;
+        const dd = document.createElement('dd');
+        dd.textContent = (typeof v === 'number')
+            ? (Number.isInteger(v) ? v : v.toFixed(4)) : v;
+        dl.appendChild(dt); dl.appendChild(dd);
+    }
+}
+
+async function loadPerTicker() {
+    const data = await fetchJSON('/api/report/per_ticker');
+    if (data.figure) {
+        Plotly.newPlot('per-ticker-chart', data.figure.data, data.figure.layout, {responsive: true});
+    }
+    const head = document.getElementById('pt-head');
+    const body = document.getElementById('pt-body');
+    head.innerHTML = ''; body.innerHTML = '';
+    if (!data.rows || data.rows.length === 0) return;
+    const cols = ['ticker', 'n_trades', 'total_return', 'sharpe',
+                  'max_drawdown', 'win_rate', 'profit_factor', 'final_equity'];
+    head.innerHTML = cols.map(c => `<th>${c}</th>`).join('');
+    for (const row of data.rows) {
+        const tds = cols.map(c => {
+            const v = row[c];
+            const text = (typeof v === 'number')
+                ? (Number.isInteger(v) ? v : v.toFixed(4)) : v;
+            return `<td>${text}</td>`;
+        }).join('');
+        const tr = document.createElement('tr');
+        tr.innerHTML = tds; body.appendChild(tr);
+    }
+}
+
+async function loadRandom() {
+    const data = await fetchJSON('/api/report/random');
+    if (data.figure) {
+        Plotly.newPlot('random-chart', data.figure.data, data.figure.layout, {responsive: true});
+    }
+    const block = document.getElementById('sig-block');
+    block.innerHTML = '';
+    if (!data.report) return;
+    const r = data.report;
+    const cls = r.is_significant ? 'sig-ok' : 'sig-no';
+    const msg = r.is_significant
+        ? `Стратегия превышает порог 3σ (z = ${r.strategy_z_score.toFixed(2)})`
+        : `Стратегия не отделима от случайных портфелей (z = ${r.strategy_z_score.toFixed(2)})`;
+    block.innerHTML = `<div class="significance ${cls}">${msg}</div>`;
+}
+
+(async () => {
+    try { await loadBacktest(); } catch (e) { console.error(e); }
+    try { await loadPerTicker(); } catch (e) { console.error(e); }
+    try { await loadRandom(); } catch (e) { console.error(e); }
+})();
+</script>
+{% endblock %}
