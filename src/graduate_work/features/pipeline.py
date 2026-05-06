@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import DataConfig, Paths
+from ..data.resample import resample_ohlcv
 from ..data.storage import load_raw_csv, save_processed
 from .scaler import StandardScaler
 from .targets import normalized_log_returns, target_columns
@@ -42,7 +43,9 @@ class PreparedDataset:
 # Сборка таблицы фич
 # ----------------------------------------------------------------------
 
-def _load_ticker_csv(paths: Paths, ticker: str) -> pd.DataFrame:
+def _load_ticker_csv(paths: Paths, ticker: str, cfg: DataConfig) -> pd.DataFrame:
+    """Загрузить сырой 1-мин CSV, ресэмплить до cfg.bar_minutes,
+    отфильтровать по торговой сессии MOEX."""
     path = paths.data_raw / "moex" / f"{ticker}.csv"
     if not path.exists():
         msg = f"Raw data not found: {path}. Run scripts/01_download_data.py first."
@@ -50,6 +53,7 @@ def _load_ticker_csv(paths: Paths, ticker: str) -> pd.DataFrame:
     df = load_raw_csv(path)
     df = df[[c for c in OHLCV_COLUMNS if c in df.columns]].copy()
     df.index.name = "timestamp"
+    df = resample_ohlcv(df, cfg)
     df["ticker"] = ticker
     return df.dropna(subset=["close"])
 
@@ -98,6 +102,9 @@ def _load_indexes(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
         df = load_raw_csv(f)
         if "close" not in df.columns:
             continue
+        df = resample_ohlcv(df, cfg)
+        if df.empty:
+            continue
         log_ret = np.log(df["close"].astype(float) / df["close"].astype(float).shift(1))
         col = f"index_{code.lower()}_logret"
         log_ret.name = col
@@ -117,7 +124,7 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
 
     for ticker in cfg.tickers:
         try:
-            ohlcv = _load_ticker_csv(paths, ticker)
+            ohlcv = _load_ticker_csv(paths, ticker, cfg)
         except FileNotFoundError as exc:
             logger.warning("%s", exc)
             continue
