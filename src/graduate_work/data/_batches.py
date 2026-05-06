@@ -15,6 +15,12 @@ from pathlib import Path
 
 import pandas as pd
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
+
 from . import storage
 
 logger = logging.getLogger(__name__)
@@ -157,7 +163,10 @@ def download_in_batches(
     if existing_max is not None:
         accumulated.append(storage.load_raw_csv(target_path))
 
-    for chunk in chunks:
+    bar = tqdm(chunks, desc=label, unit="chunk", leave=False)
+    for chunk in bar:
+        if hasattr(bar, "set_postfix_str"):
+            bar.set_postfix_str(f"{chunk[0]}..{chunk[1]}")
         df = _process_chunk(
             chunk, existing_max,
             fetch=fetch, retries=retries,
