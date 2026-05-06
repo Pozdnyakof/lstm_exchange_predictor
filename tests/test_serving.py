@@ -75,17 +75,28 @@ def test_save_and_load_artifact(tmp_path: Path) -> None:
         assert torch.allclose(v, loaded.model.state_dict()[k])
 
 
-def _fake_moex_response(rows: int = 80, *, ticker: str = "SBER") -> pd.DataFrame:
-    idx = pd.date_range("2024-01-01", periods=rows, freq="D", tz="UTC")
+def _fake_moex_response(rows: int = 5000, *, ticker: str = "SBER") -> pd.DataFrame:
+    """Имитация ответа MOEX ISS: 1-минутные бары в окне торговой сессии.
+
+    Генерим непрерывный диапазон, потом оставляем только пн-пт 07:00-15:45 UTC.
+    """
+    idx = pd.date_range("2024-01-02 07:00", periods=rows, freq="1min", tz="UTC")
+    mask = (
+        (idx.dayofweek < 5)
+        & (idx.time >= pd.Timestamp("07:00").time())
+        & (idx.time <= pd.Timestamp("15:45").time())
+    )
+    idx = idx[mask]
+    n = len(idx)
     rng = np.random.default_rng(0)
-    close = 100 + rng.standard_normal(rows).cumsum()
+    close = 100 + rng.standard_normal(n).cumsum() * 0.05
     return pd.DataFrame(
         {
-            "open": close + rng.standard_normal(rows) * 0.1,
-            "high": close + rng.uniform(0.1, 1.0, rows),
-            "low": close - rng.uniform(0.1, 1.0, rows),
+            "open": close + rng.standard_normal(n) * 0.01,
+            "high": close + rng.uniform(0.01, 0.1, n),
+            "low": close - rng.uniform(0.01, 0.1, n),
             "close": close,
-            "volume": rng.integers(1000, 5000, rows).astype(float),
+            "volume": rng.integers(100, 500, n).astype(float),
             "ticker": ticker,
         },
         index=idx,
@@ -110,7 +121,7 @@ def test_live_feature_builder_window_shape(tmp_path: Path) -> None:
     serving_cfg = ServingConfig(cache_ttl_sec=10, moex_request_pause=0.0)
     builder = LiveFeatureBuilder(loaded, data_cfg, serving_cfg)
 
-    fake = _fake_moex_response(rows=120)
+    fake = _fake_moex_response(rows=5000)
     with patch("graduate_work.serving.live_features.moex_iss.fetch_ticker", return_value=fake):
         win = builder.get_window("SBER", force_refresh=True)
 
@@ -140,8 +151,8 @@ def test_inference_service_returns_forecast(tmp_path: Path) -> None:
     service = InferenceService(loaded, data_cfg, trading_cfg, serving_cfg)
 
     fakes = {
-        "SBER": _fake_moex_response(rows=120, ticker="SBER"),
-        "GAZP": _fake_moex_response(rows=120, ticker="GAZP"),
+        "SBER": _fake_moex_response(rows=5000, ticker="SBER"),
+        "GAZP": _fake_moex_response(rows=5000, ticker="GAZP"),
     }
     with patch(
         "graduate_work.serving.live_features.moex_iss.fetch_ticker",

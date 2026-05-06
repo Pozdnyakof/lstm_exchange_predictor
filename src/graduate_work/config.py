@@ -41,15 +41,23 @@ class DataConfig:
         "IRAO", "RUAL", "NLMK", "MAGN", "AFLT", "SIBN",
         "RTKM", "MTLR", "FLOT", "SMLT",
     )
-    start_date: str = "2022-09-01"
+    start_date: str = "2024-01-01"
     end_date: str = "2026-01-31"
-    moex_interval: int = 24  # 24 = дневные свечи в MOEX ISS
+    # MOEX ISS поддерживает интервалы 1, 10, 60, 24, 7, 31. Качаем 1-мин и
+    # ресэмплируем до bar_minutes - так получаем любой целевой таймфрейм
+    # без отдельного API.
+    moex_interval: int = 1
+    bar_minutes: int = 15
+    # MOEX основная сессия: 10:00 - 18:45 МСК = 07:00 - 15:45 UTC.
+    session_start_utc: str = "07:00"
+    session_end_utc: str = "15:45"
     base_index: str = "IMOEX"
     extra_indexes: tuple[str, ...] = ("RGBI", "RTSI")
     brent_symbol: str = "BZ=F"  # Yahoo Finance тикер Brent
     cbr_currencies: tuple[str, ...] = ("USD", "EUR")
-    horizons: tuple[int, ...] = (1, 5, 10, 20)
-    window_size: int = 30
+    # Горизонты в барах (15-минутных): 1=15мин, 4=1ч, 16=4ч, 32≈торг.день.
+    horizons: tuple[int, ...] = (1, 4, 16, 32)
+    window_size: int = 64           # ~2 торговые сессии контекста
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
