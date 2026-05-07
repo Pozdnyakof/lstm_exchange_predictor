@@ -20,7 +20,8 @@ except ImportError:  # pragma: no cover - tqdm в зависимостях
     def tqdm(it, **kw):  # type: ignore[no-redef]
         return it
 
-from ..config import TrainingConfig
+from ..config import DataConfig, TradingConfig, TrainingConfig
+from .losses import WeightedBCEWithLogits, build_loss_fn
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +75,13 @@ class Trainer:
         model: nn.Module,
         cfg: TrainingConfig,
         *,
+        data_cfg: DataConfig | None = None,
+        trading_cfg: TradingConfig | None = None,
         device: str | None = None,
     ) -> None:
         self.cfg = cfg
+        self.data_cfg = data_cfg
+        self.trading_cfg = trading_cfg
         self.device = torch.device(
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"),
         )
@@ -87,9 +92,15 @@ class Trainer:
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )
-        # δ Huber-loss подбирается на основе распределения таргетов (см. fit()).
-        # До первого fit() ставим консервативный дефолт.
-        self.loss_fn = nn.HuberLoss(reduction="mean", delta=1.0)
+        # Loss выбирается по режиму:
+        #   classification (BCE / Focal) - бинарные метки;
+        #   regression (Huber, δ автоподбор в fit()) - лог-доходность.
+        if data_cfg is not None and data_cfg.mode == "classification":
+            self.loss_fn: nn.Module = build_loss_fn(data_cfg, cfg, trading_cfg)
+            self._is_classification = True
+        else:
+            self.loss_fn = nn.HuberLoss(reduction="mean", delta=1.0)
+            self._is_classification = False
         # CosineAnnealing-планировщик опционально (cfg.scheduler).
         self.lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
 
@@ -106,10 +117,9 @@ class Trainer:
             msg = "Training set is empty"
             raise ValueError(msg)
 
-        # T1.2: δ Huber подбираем по масштабу таргетов. Иначе при δ=1.0
-        # и таргете масштаба 1e-3 функция эффективно становится MSE, и
-        # модель сходится к предсказанию нуля.
-        if self.cfg.huber_delta_auto:
+        # T1.2: δ Huber подбираем по масштабу таргетов (только regression).
+        # Для classification loss выбран BCE/Focal в __init__, его не трогаем.
+        if not self._is_classification and self.cfg.huber_delta_auto:
             y_train = train_arrays["y"]
             if y_train.size > 0:
                 delta = max(2.0 * float(np.median(np.abs(y_train))), 1e-4)
@@ -265,7 +275,13 @@ class Trainer:
         y = y.to(self.device)
         with torch.set_grad_enabled(train):
             preds = self.model(x)
-            loss = self.loss_fn(preds, y)
+            # BCE / Focal принимают 3 аргумента (logits, target, weights);
+            # Huber - 2 аргумента (preds, target). Унифицируем через
+            # фиксированный Optional[weights].
+            if self._is_classification:
+                loss = self.loss_fn(preds, y, None)
+            else:
+                loss = self.loss_fn(preds, y)
             if train:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()

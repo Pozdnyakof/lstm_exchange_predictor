@@ -37,7 +37,9 @@ from graduate_work.serving import load_artifact
 from graduate_work.strategy import (
     SignalGenerator,
     attach_actual_targets,
+    attach_lr_targets,
     build_predictions_frame,
+    calibrate_bayes_threshold,
     calibrate_min_expected_return,
 )
 from graduate_work.training import mc_predict
@@ -65,21 +67,29 @@ def main() -> None:
     )
 
     # 2) Восстановить тестовую выборку (точно так же, как при обучении).
-    prepared = build_dataset(cfg.data, cfg.paths, persist=False)
+    prepared = build_dataset(
+        cfg.data, cfg.paths,
+        persist=False,
+        trading_cfg=cfg.trading,
+    )
     test = prepared.test
+    val = prepared.val
     if test["x"].shape[0] == 0:
         msg = "Test split is empty - проверьте train_ratio/val_ratio"
         raise RuntimeError(msg)
 
-    # 3) MC Dropout инференс.
+    horizons = tuple(loaded.meta.horizons)
+    mode = loaded.meta.mode  # "regression" | "classification"
+    is_classification = mode == "classification"
+
+    # 3) MC Dropout инференс на test.
     mean, std = mc_predict(
         loaded.model, test["x"],
         mc_passes=cfg.training.mc_passes,
         batch_size=cfg.training.batch_size,
         device="cpu",
+        apply_sigmoid=is_classification,
     )
-
-    horizons = tuple(loaded.meta.horizons)
     predictions = build_predictions_frame(
         timestamps=test["timestamp"],
         tickers=test["ticker"],
@@ -88,14 +98,15 @@ def main() -> None:
         horizons=horizons,
     )
 
-    # 4) T1.4: калибровка порога min_expected_return на val.
-    val = prepared.val
+    # 4) Калибровка порога на val.
+    trading_cfg = cfg.trading
     if val["x"].shape[0] > 0:
         val_mean, val_std = mc_predict(
             loaded.model, val["x"],
             mc_passes=cfg.training.mc_passes,
             batch_size=cfg.training.batch_size,
             device="cpu",
+            apply_sigmoid=is_classification,
         )
         val_predictions = build_predictions_frame(
             timestamps=val["timestamp"],
@@ -104,26 +115,42 @@ def main() -> None:
             std=val_std,
             horizons=horizons,
         )
-        val_targets = attach_actual_targets(val, horizons)
         cost_per_trade = 2.0 * (cfg.trading.commission_rate + cfg.trading.slippage_rate)
-        calib = calibrate_min_expected_return(
-            val_predictions, val_targets,
-            cost_per_trade=cost_per_trade,
-        )
-        logging.info(
-            "Calibrated threshold: T=%.5g (val signals=%d, avg=%.5g, wr=%.3f)",
-            calib.min_expected_return, calib.n_val_signals,
-            calib.val_avg_return, calib.val_win_rate,
-        )
-        trading_cfg = dataclasses.replace(
-            cfg.trading,
-            min_expected_return=calib.min_expected_return,
-        )
-    else:
-        trading_cfg = cfg.trading
+        if is_classification:
+            # Bayes-калибровка: T = c_FP / (c_FP + c_FN), где c_FN -
+            # средний positive lr на val (lr_h{h} в full_frame).
+            lr_targets = attach_lr_targets(prepared.full_frame, val, horizons)
+            calib = calibrate_bayes_threshold(
+                val_predictions, lr_targets,
+                cost_per_trade=cost_per_trade,
+            )
+            logging.info(
+                "Bayes T=%.4f (val signals=%d, avg=%.5g, wr=%.3f)",
+                calib.min_expected_return, calib.n_val_signals,
+                calib.val_avg_return, calib.val_win_rate,
+            )
+            trading_cfg = dataclasses.replace(
+                cfg.trading,
+                probability_threshold=calib.min_expected_return,
+            )
+        else:
+            val_targets = attach_actual_targets(val, horizons)
+            calib = calibrate_min_expected_return(
+                val_predictions, val_targets,
+                cost_per_trade=cost_per_trade,
+            )
+            logging.info(
+                "Calibrated T=%.5g (val signals=%d, avg=%.5g, wr=%.3f)",
+                calib.min_expected_return, calib.n_val_signals,
+                calib.val_avg_return, calib.val_win_rate,
+            )
+            trading_cfg = dataclasses.replace(
+                cfg.trading,
+                min_expected_return=calib.min_expected_return,
+            )
 
-    # Двухступенчатый фильтр (с откалиброванным порогом).
-    signals = SignalGenerator(trading_cfg).generate(predictions)
+    # Двухступенчатый фильтр.
+    signals = SignalGenerator(trading_cfg, mode=mode).generate(predictions)
 
     # 5) Цены тестового периода + buffer на хвостовые позиции.
     full_path = cfg.paths.data_processed / "features.parquet"

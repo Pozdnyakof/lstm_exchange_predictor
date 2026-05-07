@@ -7,7 +7,12 @@ from .pipeline import (
     chronological_split,
 )
 from .scaler import StandardScaler
-from .targets import normalized_log_returns
+from .targets import (
+    cost_aware_classification_labels,
+    lr_columns,
+    normalized_log_returns,
+    target_columns,
+)
 from .technical import add_technical_indicators
 from .windows import make_sliding_windows
 
@@ -18,6 +23,9 @@ __all__ = [
     "add_technical_indicators",
     "build_dataset",
     "chronological_split",
+    "cost_aware_classification_labels",
+    "lr_columns",
     "make_sliding_windows",
     "normalized_log_returns",
+    "target_columns",
 ]

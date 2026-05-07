@@ -27,6 +27,7 @@ def mc_predict(
     mc_passes: int = 50,
     batch_size: int = 256,
     device: str | None = None,
+    apply_sigmoid: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Вернуть (mean, std) по ``mc_passes`` стохастическим проходам.
 
@@ -35,7 +36,10 @@ def mc_predict(
         mean  - (N, H)
         std   - (N, H)
 
-    Где H - число горизонтов прогнозирования.
+    ``apply_sigmoid=True`` нужен для classification-режима: модель
+    выдаёт логиты, сигмоиду применяем ВНУТРИ MC-цикла на каждый
+    проход (чтобы дисперсия считалась в probability-пространстве, а
+    не в logit-пространстве). Для regression - False.
     """
     if x.shape[0] == 0:
         return np.zeros((0, 0), dtype=np.float32), np.zeros((0, 0), dtype=np.float32)
@@ -54,7 +58,10 @@ def mc_predict(
             preds: list[np.ndarray] = []
             for start in range(0, tensor_x.shape[0], batch_size):
                 batch = tensor_x[start:start + batch_size].to(target_device)
-                preds.append(model(batch).detach().cpu().numpy())
+                out = model(batch)
+                if apply_sigmoid:
+                    out = torch.sigmoid(out)
+                preds.append(out.detach().cpu().numpy())
             all_passes.append(np.concatenate(preds, axis=0))
         stacked = np.stack(all_passes, axis=0)   # (P, N, H)
     finally:

@@ -27,10 +27,10 @@ def _intraday_prices(n_bars: int = 30, ticker: str = "TEST") -> pd.DataFrame:
 
 
 def test_engine_holds_for_horizon_bars_not_days() -> None:
-    """horizon=3 должен означать 3 бара, не 3 дня."""
+    """horizon=3 должен означать 3 бара, не 3 дня. Entry на open
+    бара t+1 после сигнала (устранение look-ahead)."""
     prices = _intraday_prices(n_bars=20)
     cfg = TradingConfig(initial_capital=100_000, max_positions=1)
-    # BUY на первом баре, horizon=3 -> закрываемся на баре с индексом 3.
     signals = pd.DataFrame(
         [{
             "timestamp": prices.index[0],
@@ -41,9 +41,9 @@ def test_engine_holds_for_horizon_bars_not_days() -> None:
     bt = run_backtest(signals, prices, cfg)
     assert len(bt.trades) == 1
     trade = bt.trades.iloc[0]
-    # Закрытие должно произойти на баре 3 (bar 0=open, 3=close).
-    assert trade["open_date"] == prices.index[0]
-    assert trade["close_date"] == prices.index[3]
+    # Сигнал на bar 0 → entry на bar 1 (open) → exit на bar 1+3=4 (open).
+    assert trade["open_date"] == prices.index[1]
+    assert trade["close_date"] == prices.index[4]
 
 
 def test_random_monkeys_use_bar_horizon() -> None:
@@ -169,9 +169,10 @@ def test_engine_does_not_open_second_position_on_same_ticker() -> None:
         ],
     )
     bt = run_backtest(signals, prices, cfg)
-    # Должна получиться ровно одна сделка (вторая залимитировала uniqueness).
+    # Должна получиться ровно одна сделка. Open на bar 1 (open) - сдвиг
+    # на 1 бар после сигнала bar 0.
     assert len(bt.trades) == 1
-    assert bt.trades.iloc[0]["open_date"] == idx[0]
+    assert bt.trades.iloc[0]["open_date"] == idx[1]
 
 
 def test_engine_holds_multiple_tickers_in_parallel() -> None:

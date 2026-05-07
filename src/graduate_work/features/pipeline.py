@@ -15,12 +15,17 @@ except ImportError:  # pragma: no cover - tqdm в зависимостях
     def tqdm(it, **kw):  # type: ignore[no-redef]
         return it
 
-from ..config import DataConfig, Paths
+from ..config import DataConfig, Paths, TradingConfig
 from ..data.resample import resample_ohlcv
 from ..data.storage import load_raw_csv, save_processed
 from .advanced import add_advanced_indicators
 from .scaler import StandardScaler
-from .targets import normalized_log_returns, target_columns
+from .targets import (
+    cost_aware_classification_labels,
+    lr_columns,
+    normalized_log_returns,
+    target_columns,
+)
 from .technical import OHLCV_COLUMNS, add_technical_indicators
 from .windows import make_sliding_windows
 
@@ -148,7 +153,40 @@ def _index_log_returns(indexes: pd.DataFrame, target_index: pd.DatetimeIndex) ->
     return out
 
 
-def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, list[str]]:
+def _build_targets(
+    feat: pd.DataFrame,
+    cfg: DataConfig,
+    trading_cfg: TradingConfig | None,
+) -> pd.DataFrame:
+    """Построить целевые колонки по режиму.
+
+    Regression: только `target_h{h}` = нормализованная лог-доходность.
+    Classification: `target_h{h}` (бинарные сглаженные метки) +
+                    `lr_h{h}` (сырая лог-доходность с костами).
+    """
+    if cfg.mode == "regression":
+        return normalized_log_returns(feat["close"], cfg.horizons)
+    # classification
+    direction = "short" if cfg.swap_long_short_labels else "long"
+    entry_cost = trading_cfg.commission_rate + trading_cfg.slippage_rate if trading_cfg else 0.0
+    exit_cost = entry_cost
+    return cost_aware_classification_labels(
+        open_price=feat["open"],
+        close_price=feat["close"],
+        horizons=cfg.horizons,
+        entry_cost=entry_cost,
+        exit_cost=exit_cost,
+        label_smoothing=cfg.label_smoothing,
+        direction=direction,
+    )
+
+
+def build_feature_frame(
+    cfg: DataConfig,
+    paths: Paths,
+    *,
+    trading_cfg: TradingConfig | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """Объединить тикеры с макро/индексной частью, посчитать фичи и таргеты."""
     macro = _load_macro(paths, cfg)
     indexes = _load_indexes(paths, cfg)
@@ -180,11 +218,15 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
             idx_logret = _index_log_returns(indexes, feat.index)
             feat = pd.concat([feat, idx_logret], axis=1)
 
-        targets = normalized_log_returns(feat["close"], cfg.horizons)
+        targets = _build_targets(feat, cfg, trading_cfg)
         feat = pd.concat([feat, targets], axis=1)
 
         if feature_cols is None:
-            ban = {"ticker", *target_columns(cfg.horizons), "open", "high", "low"}
+            ban = {
+                "ticker", "open", "high", "low",
+                *target_columns(cfg.horizons),
+                *lr_columns(cfg.horizons),  # raw lr - не фича, нужна для калибровки
+            }
             feature_cols = [c for c in feat.columns if c not in ban]
 
         frames.append(feat)
@@ -310,9 +352,14 @@ def build_dataset(
     paths: Paths,
     *,
     persist: bool = True,
+    trading_cfg: TradingConfig | None = None,
 ) -> PreparedDataset:
-    """Полный конвейер: загрузка → фичи → нормализация → окна."""
-    full, feature_cols = build_feature_frame(cfg, paths)
+    """Полный конвейер: загрузка → фичи → нормализация → окна.
+
+    ``trading_cfg`` нужен для классификационных меток (используются
+    transactions costs из него). Если None - lab-режим без костов.
+    """
+    full, feature_cols = build_feature_frame(cfg, paths, trading_cfg=trading_cfg)
     full = full.dropna(subset=feature_cols)  # отбросить строки с NaN признаками
 
     # Purge: target_h на хвосте train/val подсматривает в следующий

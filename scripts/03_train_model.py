@@ -28,10 +28,14 @@ def main() -> None:
     cfg = default_config()
     set_seed(cfg.training.seed)
 
-    prepared = build_dataset(cfg.data, cfg.paths, persist=True)
+    prepared = build_dataset(
+        cfg.data, cfg.paths,
+        persist=True,
+        trading_cfg=cfg.trading,   # нужно для costs в classification labels
+    )
     logging.info(
-        "Dataset: features=%d, horizons=%d, train=%d val=%d test=%d",
-        prepared.num_features, len(cfg.data.horizons),
+        "Mode=%s, features=%d, horizons=%d, train=%d val=%d test=%d",
+        cfg.data.mode, prepared.num_features, len(cfg.data.horizons),
         prepared.train["x"].shape[0],
         prepared.val["x"].shape[0],
         prepared.test["x"].shape[0],
@@ -42,7 +46,11 @@ def main() -> None:
         num_horizons=len(cfg.data.horizons),
         cfg=cfg.model,
     )
-    trainer = Trainer(model, cfg.training)
+    trainer = Trainer(
+        model, cfg.training,
+        data_cfg=cfg.data,
+        trading_cfg=cfg.trading,
+    )
     history = trainer.fit(prepared.train, prepared.val)
     logging.info(
         "Training done: best_epoch=%d val_loss=%.6f",
@@ -59,6 +67,7 @@ def main() -> None:
         model_config=_dc.asdict(cfg.model),
         training_date=now_iso(),
         tickers=list(cfg.data.tickers),
+        mode=cfg.data.mode,
     )
     paths = save_artifact(model, prepared.scaler, meta, cfg.paths.checkpoints)
     for k, p in paths.items():

@@ -51,6 +51,20 @@ def _price_lookup(prices: pd.DataFrame) -> dict[tuple[pd.Timestamp, str], float]
     return lookup
 
 
+def _open_lookup(prices: pd.DataFrame) -> dict[tuple[pd.Timestamp, str], float]:
+    """Та же индексация, но по колонке `open`. Используется для входа/
+    выхода через open[t+1] - устраняет look-ahead bias.
+    """
+    if "open" not in prices.columns:
+        # Fallback: если open не передан, используем close (старое
+        # поведение).
+        return _price_lookup(prices)
+    lookup: dict[tuple[pd.Timestamp, str], float] = {}
+    for ts, ticker, op in zip(prices.index, prices["ticker"], prices["open"], strict=True):
+        lookup[(pd.Timestamp(ts), str(ticker))] = float(op)
+    return lookup
+
+
 def run_backtest(
     signals: pd.DataFrame,
     prices: pd.DataFrame,
@@ -79,7 +93,13 @@ def run_backtest(
     else:
         prices.index = prices.index.tz_convert("UTC")
 
-    lookup = _price_lookup(prices)
+    close_lookup = _price_lookup(prices)
+    open_lookup = _open_lookup(prices)
+    # close_lookup используем для mark-to-market (промежуточная оценка
+    # капитала), open_lookup - для входа/выхода на open следующего бара
+    # (соответствует cost-aware-меткам из labeling).
+    lookup = close_lookup  # backward-compat alias для остальной логики
+
     trading_days = pd.DatetimeIndex(sorted(prices.index.unique()))
     # Map timestamp -> integer position in trading_days. Используется для
     # строгого "horizon в барах": exit_idx = entry_idx + horizon.
@@ -102,16 +122,14 @@ def run_backtest(
         still_open: list[dict] = []
         for pos in open_positions:
             if pos["close_date"] == day:
-                exit_price = lookup.get((day, pos["ticker"]))
+                # Exit по open текущего бара (согласовано с labeling -
+                # `close[t+1+horizon]` ↔ позиция закрывается ровно через
+                # `horizon` баров после entry-open).
+                exit_price = open_lookup.get((day, pos["ticker"]))
                 if exit_price is None:
-                    # Нет данных по этому тикеру в этом баре - продлеваем
-                    # на СЛЕДУЮЩИЙ БАР календаря (не на сутки!). При
-                    # 5-минутном таймфрейме старая логика days=1 добавляла
-                    # 24 часа stale-экспозиции, искажая PnL.
                     cur_idx = bar_index.get(day)
                     if cur_idx is None or cur_idx + 1 >= len(trading_days):
-                        # Конец тестового окна - закрываем по entry-цене
-                        # (нулевой PnL), чтобы не тащить позицию вечно.
+                        # Конец тестового окна - закрываем по entry-цене.
                         exit_price = pos["entry_price"]
                     else:
                         pos["close_date"] = trading_days[cur_idx + 1]
@@ -153,7 +171,21 @@ def run_backtest(
                 # Капитал делим равномерно между новыми входами.
                 budget = cash / max(free_slots, 1)
                 for _, row in top.iterrows():
-                    price = lookup.get((day, row["ticker"]))
+                    horizon_bars = int(row["horizon"])
+                    entry_idx = bar_index.get(day)
+                    # Сигнал в баре t → entry на open бара t+1, exit на
+                    # open бара t+1+horizon. Так устраняется look-ahead
+                    # (executable сразу после close сигнала) и сходится
+                    # с лейблингом (label считает return от open[t+1]).
+                    if (
+                        entry_idx is None
+                        or entry_idx + 1 + horizon_bars >= len(trading_days)
+                    ):
+                        # Не хватит баров на entry+exit - пропускаем.
+                        continue
+                    entry_bar = trading_days[entry_idx + 1]
+                    exit_bar = trading_days[entry_idx + 1 + horizon_bars]
+                    price = open_lookup.get((entry_bar, row["ticker"]))
                     if price is None or price <= 0:
                         continue
                     invest = min(cash, budget)
@@ -164,21 +196,12 @@ def run_backtest(
                     if qty <= 0:
                         continue
                     cash -= invest
-                    # Horizon выражен в БАРАХ - закрываем позицию через
-                    # row["horizon"] баров от текущего entry-бара.
-                    entry_idx = bar_index.get(day)
-                    horizon_bars = int(row["horizon"])
-                    if entry_idx is None or entry_idx + horizon_bars >= len(trading_days):
-                        # Прогноз уходит за хвост тестового окна - откат.
-                        cash += invest
-                        continue
-                    close_date = trading_days[entry_idx + horizon_bars]
                     open_positions.append(
                         {
-                            "open_date": day,
-                            "close_date": close_date,
+                            "open_date": entry_bar,
+                            "close_date": exit_bar,
                             "ticker": str(row["ticker"]),
-                            "horizon": int(row["horizon"]),
+                            "horizon": horizon_bars,
                             "entry_price": price,
                             "quantity": qty,
                             "invested": invest,
@@ -230,13 +253,17 @@ def run_backtest(
 # --------------------------------------------------------------------------
 
 def prices_from_full_frame(full: pd.DataFrame) -> pd.DataFrame:
-    """Срезать из таблицы фич минимальный набор колонок (close + ticker).
+    """Срезать из таблицы фич минимальный набор колонок (open, close, ticker).
 
-    Индекс должен оставаться DatetimeIndex (timestamp).
+    Индекс остаётся DatetimeIndex (timestamp). ``open`` нужен engine'у
+    для входа/выхода на open[t+1] — устранение look-ahead bias.
     """
     needed = {"close", "ticker"}
     if not needed.issubset(full.columns):
         msg = f"full_frame must contain columns {needed}"
         raise ValueError(msg)
-    out = full[["close", "ticker"]].copy()
+    keep = ["close", "ticker"]
+    if "open" in full.columns:
+        keep = ["open", *keep]
+    out = full[keep].copy()
     return out

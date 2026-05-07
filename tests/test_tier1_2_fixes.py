@@ -39,15 +39,20 @@ from graduate_work.training import Trainer, set_seed
 # ---------------------------------------------------------------------------
 
 def test_engine_rollover_uses_next_bar_not_day() -> None:
-    """Если на close_date нет цены - продлеваем на 1 БАР, не на сутки."""
+    """Если на close_date нет цены - продлеваем на 1 БАР, не на сутки.
+
+    После фикса entry-on-next-open: сигнал bar 0 → entry bar 1 →
+    запланированный exit на bar 1+5=6. Если в bar 6 цены нет, движок
+    откатит на bar 7 (1 бар, не сутки).
+    """
     n = 30
     idx = pd.date_range("2024-01-02 07:00", periods=n, freq="5min", tz="UTC")
     prices = pd.DataFrame(
         {"close": np.linspace(100.0, 110.0, n), "ticker": "TST"},
         index=idx,
     )
-    # Удаляем цену в баре 5 (entry_idx=0 + horizon=5 = 5).
-    prices = prices.drop(idx[5])
+    # Удаляем цену в bar 6 - именно где должен сработать exit.
+    prices = prices.drop(idx[6])
     cfg = TradingConfig(
         initial_capital=100_000.0, max_positions=1,
         commission_rate=0.0, slippage_rate=0.0,
@@ -57,14 +62,11 @@ def test_engine_rollover_uses_next_bar_not_day() -> None:
           "horizon": 5, "mean": 0.01, "std": 0.001, "action": "BUY"}],
     )
     bt = run_backtest(signals, prices, cfg)
-    # Должна получиться ровно одна сделка, закрытая в баре 6 (rollover на +1 бар).
     assert len(bt.trades) == 1
     trade = bt.trades.iloc[0]
-    # close_date - один из существующих баров, не +24h.
     assert trade["close_date"] in prices.index
-    # Закрытие точно через 1 бар после исходного horizon.
-    expected_close = idx[6]   # idx[5] removed → next is idx[6]
-    assert trade["close_date"] == expected_close
+    # bar 6 удалён → rollover ровно на bar 7.
+    assert trade["close_date"] == idx[7]
 
 
 # ---------------------------------------------------------------------------

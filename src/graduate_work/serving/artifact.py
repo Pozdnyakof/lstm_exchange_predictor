@@ -39,6 +39,9 @@ class ModelMeta:
     model_config: dict
     training_date: str
     tickers: list[str]
+    # Режим обучения: "regression" | "classification".
+    # Старые артефакты без этого поля считаются "regression" по умолчанию.
+    mode: str = "regression"
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)

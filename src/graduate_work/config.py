@@ -73,10 +73,22 @@ class DataConfig:
     # Горизонты прогноза в барах (5-минутных): 1=5мин, 3=15мин, 6=30мин, 12=1ч.
     horizons: tuple[int, ...] = (1, 3, 6, 12)
     window_size: int = 48  # 4 часа контекста ~ половина торг. сессии
-    # T2.1: per-ticker dummies как exogenous-фичи. Один общий регрессор
-    # на 12 разных тикерах усредняет поведение; one-hot позволяет модели
-    # специализироваться без отдельных моделей.
+    # T2.1: per-ticker dummies как exogenous-фичи.
     use_ticker_dummies: bool = True
+
+    # === РЕЖИМ ОБУЧЕНИЯ ===
+    # "regression"     — model выдаёт нормализованную лог-доходность,
+    #                    Huber-loss, фильтр по mean (предыдущий путь).
+    # "classification" — бинарный таргет "прибыль ≥ 0 после костов",
+    #                    BCE-loss, фильтр по вероятности (Bayes-порог).
+    # При смене ОБЯЗАТЕЛЬНО переобучить модель.
+    mode: str = "classification"
+    # Сглаживание меток (label smoothing) для классификации:
+    # 0.0 → жёсткие {0, 1}; 0.05 → {0.05, 0.95}.
+    label_smoothing: float = 0.0
+    # Если True - голова обучается предсказывать выгодность ШОРТА (lr<0)
+    # вместо лонга. По умолчанию False (стандартный лонг-фокус).
+    swap_long_short_labels: bool = False
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
@@ -160,15 +172,29 @@ class TradingConfig:
     commission_rate: float = 0.0003
     slippage_rate: float = 0.0002
     max_positions: int = 5  # сколько активов держим одновременно
-    min_expected_return: float = 0.0005  # порог по среднему MC прогнозу
-    max_uncertainty: float = 0.02  # порог по std MC прогноза
-    # T2.3: Bonferroni-style коррекция при выборе argmax-горизонта.
-    # При выборе MAX из N независимых сигналов (по горизонтам) под H0
-    # ожидаемая величина растёт как ~σ·sqrt(2·ln(N)). Поэтому требуем
-    # mean ≥ min_expected_return × bonferroni_factor.
-    # Для N=4: 1/Φ⁻¹(1 - 0.05/4) ≈ 1.65σ → 2.24σ ⇒ factor ≈ 1.36.
-    # Используем 1.5 как умеренно консервативный.
+    # === REGRESSION (старый путь) ===
+    min_expected_return: float = 0.0005  # порог mean-прогноза
+    max_uncertainty: float = 0.02        # порог std-прогноза
     horizon_argmax_correction: float = 1.5
+
+    # === CLASSIFICATION ===
+    # Базовый порог вероятности для BUY-сигнала. Финальный порог
+    # вычисляется из Bayes-формулы (cost / (cost + gain)) на val,
+    # это значение - fallback при неудаче калибровки.
+    probability_threshold: float = 0.55
+    # Максимальный std MC-прогноза вероятности. Для классификации
+    # используется meaningful range [0, 1], 0.25 - умеренная отсечка.
+    max_probability_std: float = 0.25
+    # Šidák-коррекция при выборе argmax-горизонта (исследование R-0007):
+    # T_eff = T^(1/N_horizons). "none" | "sidak" | "bonferroni"
+    selection_correction: str = "sidak"
+
+    # === LOSS ===
+    # "bce"   — обычный binary cross-entropy (дефолт для классификации)
+    # "focal" — focal-loss; полезен при дисбалансе классов
+    loss_objective: str = "bce"
+    focal_gamma: float = 2.0
+    focal_alpha: float = 0.25
     # Случайные портфели:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0
