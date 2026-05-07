@@ -171,7 +171,11 @@ class TrainingConfig:
     epochs: int = 40
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    early_stopping_patience: int = 6
+    # 12 эпох вместо 6: даёт обучению время преодолеть начальный
+    # «predict-the-prior» минимум и доехать до SWA-фазы. У тебя при
+    # patience=6 best обычно был на эпохе 1-2, и SWA не успевал
+    # активироваться.
+    early_stopping_patience: int = 12
     grad_clip: float = 1.0
     seed: int = 42
     # 100 проходов вместо 50 - точнее оценка эпистемической
@@ -181,7 +185,9 @@ class TrainingConfig:
     # весов после swa_start_frac × epochs. Даёт более плоский минимум
     # loss landscape и снижает дисперсию по сидам.
     use_swa: bool = True
-    swa_start_frac: float = 0.5
+    # 0.2 вместо 0.5: при early-stopping на эпохе ~10 SWA должен успеть
+    # включиться (старт на эпохе 0.2*40=8 при патиенс=12).
+    swa_start_frac: float = 0.2
     swa_lr: float = 5e-4
     # T1.2: Huber-δ автоматически вычисляется из распределения таргетов
     # (≈ 2 × median(|y_train|)). Защищает от ошибки когда δ=1.0 слишком

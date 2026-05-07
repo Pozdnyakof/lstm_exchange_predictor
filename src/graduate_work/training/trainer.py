@@ -117,14 +117,7 @@ class Trainer:
             msg = "Training set is empty"
             raise ValueError(msg)
 
-        # T1.2: δ Huber подбираем по масштабу таргетов (только regression).
-        # Для classification loss выбран BCE/Focal в __init__, его не трогаем.
-        if not self._is_classification and self.cfg.huber_delta_auto:
-            y_train = train_arrays["y"]
-            if y_train.size > 0:
-                delta = max(2.0 * float(np.median(np.abs(y_train))), 1e-4)
-                self.loss_fn = nn.HuberLoss(reduction="mean", delta=delta)
-                logger.info("Auto Huber-delta: %.5g (from train target scale)", delta)
+        self._auto_tune_loss(train_arrays["y"])
 
         # T2.2: CosineAnnealingLR-планировщик. Длится все epochs;
         # при early stopping просто прерывается на полпути.
@@ -166,6 +159,30 @@ class Trainer:
             self.model.load_state_dict(ctx.best_state)
         self._save_checkpoint(checkpoint_path)
         return history
+
+    def _auto_tune_loss(self, y_train: np.ndarray) -> None:
+        """Настройка loss-функции по статистике train-таргетов."""
+        if y_train.size == 0:
+            return
+        # T1.2: Huber-δ для regression — масштабируем под медиану |y|.
+        if not self._is_classification and self.cfg.huber_delta_auto:
+            delta = max(2.0 * float(np.median(np.abs(y_train))), 1e-4)
+            self.loss_fn = nn.HuberLoss(reduction="mean", delta=delta)
+            logger.info("Auto Huber-delta: %.5g (from train target scale)", delta)
+            return
+        # Anti-collapse: per-horizon pos_weight = (1 - P(UP)) / P(UP).
+        # Без него BCE на дисбалансе классов сходится к константе ≈ prior
+        # ("prediction collapse"). Focal не трогаем — у него своя логика.
+        if self._is_classification and isinstance(self.loss_fn, WeightedBCEWithLogits):
+            p_up = np.clip(y_train.mean(axis=0), 0.05, 0.95)
+            pos_weight = (1.0 - p_up) / p_up
+            pw_tensor = torch.tensor(pos_weight, dtype=torch.float32)
+            self.loss_fn = WeightedBCEWithLogits(pos_weight=pw_tensor).to(self.device)
+            logger.info(
+                "Auto pos_weight per horizon: %s (from P(UP)=%s)",
+                np.round(pos_weight, 3).tolist(),
+                np.round(p_up, 3).tolist(),
+            )
 
     def _init_swa(self, ctx: _FitContext) -> None:
         if not self.cfg.use_swa:

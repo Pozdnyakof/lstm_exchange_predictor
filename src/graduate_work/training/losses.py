@@ -14,11 +14,23 @@ class WeightedBCEWithLogits(nn.Module):
 
     Принимает (B, H) логиты и (B, H) сглаженные метки в [0, 1].
     Per-element BCE, потом среднее по B*H. Опциональный per-sample вес.
+
+    ``pos_weight`` (shape (H,)) умножает вклад positives в loss и
+    предотвращает prediction collapse при дисбалансе классов: без него
+    модель быстро сходится к константе ≈ P(UP) и не использует вход.
+    Канонический рецепт: ``pos_weight = (1 - P(UP)) / P(UP)``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, pos_weight: torch.Tensor | None = None) -> None:
         super().__init__()
-        self._base = nn.BCEWithLogitsLoss(reduction="none")
+        # register_buffer чтобы тензор автоматически уезжал на тот же
+        # device, что и модуль, через .to(...). None разрешён в новых
+        # PyTorch (>=1.10) и трактуется как «буфера нет».
+        self.register_buffer(
+            "pos_weight",
+            pos_weight.float() if pos_weight is not None else None,
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -26,9 +38,12 @@ class WeightedBCEWithLogits(nn.Module):
         target: torch.Tensor,
         weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        loss = self._base(logits, target)        # (B, H)
+        loss = F.binary_cross_entropy_with_logits(
+            logits, target, reduction="none",
+            pos_weight=self.pos_weight,
+        )
         if weights is not None:
-            loss = loss * weights.unsqueeze(-1)   # (B, 1) broadcast по H
+            loss = loss * weights.unsqueeze(-1)
         return loss.mean()
 
 

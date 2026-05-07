@@ -15,6 +15,7 @@ import dataclasses
 
 import numpy as np
 import pandas as pd
+import pytest
 import torch
 
 from graduate_work.config import (
@@ -163,6 +164,72 @@ def test_trainer_classification_runs_and_outputs_logits() -> None:
         logits = model(torch.from_numpy(x_va))
     # При случайной модели логиты разлетаются за [0,1].
     assert logits.shape == (n_val, h)
+
+
+def test_trainer_auto_pos_weight_for_imbalanced_classification() -> None:
+    """Anti-collapse: BCE должен получить per-horizon pos_weight = (1-p)/p."""
+    set_seed(0)
+    rng = np.random.default_rng(0)
+    n_train, n_val = 200, 50
+    t, f, h = 8, 4, 2
+    x_tr = rng.standard_normal((n_train, t, f)).astype(np.float32)
+    # h=0: P(UP)=0.20  ->  pos_weight ≈ 4.0
+    # h=1: P(UP)=0.50  ->  pos_weight ≈ 1.0
+    y_tr = np.zeros((n_train, h), dtype=np.float32)
+    y_tr[:40, 0] = 1.0   # 20% positives для горизонта 0
+    y_tr[:100, 1] = 1.0  # 50% positives для горизонта 1
+    x_va = rng.standard_normal((n_val, t, f)).astype(np.float32)
+    y_va = np.zeros((n_val, h), dtype=np.float32)
+
+    model_cfg = ModelConfig(
+        conv_channels=4, conv_kernel=3, lstm_hidden=4, lstm_layers=1,
+        fc_hidden=4, dropout=0.0, use_revin=False,
+    )
+    model = ConvLstmRegressor(input_dim=f, num_horizons=h, cfg=model_cfg)
+    data_cfg = DataConfig(mode="classification")
+    train_cfg = TrainingConfig(
+        batch_size=32, epochs=1, learning_rate=1e-3,
+        early_stopping_patience=10, use_swa=False, scheduler="none",
+    )
+    trading_cfg = TradingConfig(loss_objective="bce")
+    trainer = Trainer(
+        model, train_cfg,
+        data_cfg=data_cfg, trading_cfg=trading_cfg,
+        device="cpu",
+    )
+    trainer.fit({"x": x_tr, "y": y_tr}, {"x": x_va, "y": y_va})
+
+    pw = trainer.loss_fn.pos_weight
+    assert pw is not None
+    assert pw.shape == (h,)
+    # h=0: (1-0.2)/0.2 = 4.0
+    # h=1: (1-0.5)/0.5 = 1.0
+    assert pw[0].item() == pytest.approx(4.0, rel=0.05)
+    assert pw[1].item() == pytest.approx(1.0, rel=0.05)
+
+
+def test_weighted_bce_pos_weight_pushes_logits_up_for_minority_class() -> None:
+    """Sanity-check: на сильном дисбалансе модель с pos_weight НЕ
+    схлопывается на маргинальное P(UP)."""
+    set_seed(0)
+    # Без pos_weight оптимальный логит ~ logit(p_up)=logit(0.1)≈-2.2.
+    # С pos_weight=(1-p)/p≈9.0 оптимальный логит = logit(0.5)=0.0.
+    n, h = 100, 1
+    target = torch.zeros(n, h)
+    target[:10] = 1.0  # 10% positives.
+    logits = torch.zeros(n, h, requires_grad=True)
+    optim = torch.optim.SGD([logits], lr=0.5)
+
+    pw = torch.tensor([(1.0 - 0.1) / 0.1])
+    loss_fn = WeightedBCEWithLogits(pos_weight=pw)
+    for _ in range(200):
+        optim.zero_grad()
+        loss = loss_fn(logits, target)
+        loss.backward()
+        optim.step()
+    # С pos_weight оптимум — около 0 (равные веса positives и negatives
+    # балансируют), а не logit(0.1)=-2.2 как было бы в простом BCE.
+    assert abs(logits.detach().mean().item()) < 0.5
 
 
 # ---------------------------------------------------------------------------
