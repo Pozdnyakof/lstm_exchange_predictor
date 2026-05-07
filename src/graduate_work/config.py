@@ -38,8 +38,8 @@ class DataConfig:
     # CSV всех 30 тикеров остаются на диске и Drive — для перерасчёта
     # достаточно поменять этот кортеж.
     tickers: tuple[str, ...] = (
-        "GMKN", "RUAL", "SIBN", "NLMK", "PLZL", "NVTK",
-        "FLOT", "GAZP", "MTSS", "MGNT", "SNGS", "PHOR",
+        "GMKN",
+        "PLZL",
     )
     start_date: str = "2020-01-01"
     end_date: str = "2026-01-01"
@@ -76,9 +76,11 @@ class DataConfig:
     # ≈0.10%): на 4-часовой дистанции реалистичные движения легко
     # перекрывают costs, что улучшает баланс классов в cost-aware метках.
     horizons: tuple[int, ...] = (6, 12, 24, 48)
-    # 8 часов контекста (~1 сессия). При горизонте 4ч соотношение
-    # look-back:forecast = 2:1 — стандарт для time-series Transformer'ов.
-    window_size: int = 96
+    # 32 часа контекста (~3.6 сессии). Соотношение look-back:forecast = 8:1
+    # под максимальный горизонт 4ч — соответствует R-0023 baseline
+    # (15-мин бары, seq_len=128, max_h=16 бар: 128/16=8). На 5-мин барах
+    # тот же 8:1 даёт 384 бара контекста.
+    window_size: int = 384
     # T2.1: per-ticker dummies как exogenous-фичи.
     use_ticker_dummies: bool = True
 
@@ -141,14 +143,15 @@ class ModelConfig:
 
     # === TimeXer-параметры (architecture="timexer") ===
     # Значения соответствуют R-0023 baseline; seq_len выровнен под
-    # window_size=96 (8 часов): patch_len=16, stride=8 -> 11 патчей.
+    # window_size=384 (32 часа): patch_len=48, stride=24 -> 15 патчей,
+    # та же patch-сетка, что у research (15 патчей при seq=128/p=16/s=8).
     timexer_d_model: int = 128
     timexer_n_layers: int = 3
     timexer_n_heads: int = 8
     timexer_d_ff: int = 256
-    timexer_patch_len: int = 16
-    timexer_stride: int = 8
-    timexer_seq_len: int = 96
+    timexer_patch_len: int = 48
+    timexer_stride: int = 24
+    timexer_seq_len: int = 384
     timexer_dropout: float = 0.3
     # n_exo=0: все каналы эндогенные (в т.ч. ticker dummies). Если
     # отделять exo (например, индексные returns) - указывается их
@@ -185,8 +188,8 @@ class TrainingConfig:
     # большой для нормализованных лог-доходностей масштаба ~1e-3.
     huber_delta_auto: bool = True
     # T2.2: AdamW + CosineAnnealing вместо плоского Adam.
-    optimizer: str = "adamw"     # adam | adamw
-    scheduler: str = "cosine"    # none | cosine
+    optimizer: str = "adamw"  # adam | adamw
+    scheduler: str = "cosine"  # none | cosine
 
 
 @dataclass(frozen=True)
@@ -205,7 +208,7 @@ class TradingConfig:
     max_positions: int = 5  # сколько активов держим одновременно
     # === REGRESSION (старый путь) ===
     min_expected_return: float = 0.0005  # порог mean-прогноза
-    max_uncertainty: float = 0.02        # порог std-прогноза
+    max_uncertainty: float = 0.02  # порог std-прогноза
     horizon_argmax_correction: float = 1.5
 
     # === CLASSIFICATION ===
