@@ -110,19 +110,44 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Гиперпараметры гибридной сети 1D-CNN + LSTM."""
+    """Гиперпараметры архитектуры.
 
+    ``architecture`` выбирает фактическую сеть:
+    - ``"timexer"`` — Transformer-baseline из исследовательского
+      журнала (R-0023, R09.M). Используется по умолчанию.
+    - ``"conv_lstm"`` — гибридная 1D-CNN + LSTM, исходная архитектура §2.2.
+    """
+
+    architecture: str = "timexer"
+
+    # === Общие параметры ===
+    fc_hidden: int = 64
+    dropout: float = 0.3
+    # Reversible Instance Normalization (Kim et al. 2022) поверх входа.
+    use_revin: bool = True
+    revin_affine: bool = True
+
+    # === ConvLSTM-параметры (architecture="conv_lstm") ===
     conv_channels: int = 64
     conv_kernel: int = 5
     lstm_hidden: int = 128
     lstm_layers: int = 2
-    fc_hidden: int = 64
-    dropout: float = 0.3
-    # Reversible Instance Normalization (Kim et al. 2022) поверх входа.
-    # Адаптивная per-instance нормализация дополняет глобальный
-    # StandardScaler и помогает при distribution shift между периодами.
-    use_revin: bool = True
-    revin_affine: bool = True
+
+    # === TimeXer-параметры (architecture="timexer") ===
+    # Значения соответствуют R-0023 baseline; seq_len выровнен под
+    # window_size=48 (4 часа): patch_len=8, stride=4 -> 11 патчей.
+    timexer_d_model: int = 128
+    timexer_n_layers: int = 3
+    timexer_n_heads: int = 8
+    timexer_d_ff: int = 256
+    timexer_patch_len: int = 8
+    timexer_stride: int = 4
+    timexer_seq_len: int = 48
+    timexer_dropout: float = 0.3
+    # n_exo=0: все каналы эндогенные (в т.ч. ticker dummies). Если
+    # отделять exo (например, индексные returns) - указывается их
+    # количество, и они попадают в последние n_exo колонок входа.
+    timexer_n_exo: int = 0
 
 
 @dataclass(frozen=True)

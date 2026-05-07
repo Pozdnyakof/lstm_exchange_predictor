@@ -278,6 +278,7 @@ def test_signal_generator_classification_rejects_high_uncertainty() -> None:
 def test_model_meta_classification_round_trip(tmp_path) -> None:
     feature_cols = ["a", "b"]
     model_cfg = ModelConfig(
+        architecture="conv_lstm",
         conv_channels=4, conv_kernel=3, lstm_hidden=4, lstm_layers=1,
         fc_hidden=4, dropout=0.0, use_revin=False,
     )

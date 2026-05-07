@@ -32,6 +32,7 @@ from graduate_work.serving.artifact import now_iso
 
 def _build_meta(feature_cols: list[str], horizons: tuple[int, ...]) -> ModelMeta:
     cfg = ModelConfig(
+        architecture="conv_lstm",
         conv_channels=8, conv_kernel=3,
         lstm_hidden=16, lstm_layers=1,
         fc_hidden=16, dropout=0.3,

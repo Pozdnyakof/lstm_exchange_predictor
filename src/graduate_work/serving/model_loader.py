@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 from ..features import StandardScaler
-from ..model import ConvLstmRegressor
+from ..model import build_model
 from .artifact import ARTIFACT_NAME, META_NAME, SCALER_NAME, ModelMeta
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class LoadedModel:
     """Готовая к инференсу модель + всё, что нужно для предобработки."""
 
-    model: ConvLstmRegressor
+    model: torch.nn.Module
     scaler: StandardScaler
     meta: ModelMeta
     device: torch.device
@@ -48,7 +48,7 @@ def load_artifact(checkpoint_dir: Path, *, device: str | None = None) -> LoadedM
     target_device = torch.device(
         device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"),
     )
-    model = ConvLstmRegressor(
+    model = build_model(
         input_dim=meta.num_features,
         num_horizons=meta.num_horizons,
         cfg=meta.model_cfg(),
