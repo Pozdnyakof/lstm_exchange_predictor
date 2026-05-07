@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - tqdm в зависимостях
 from ..config import DataConfig, Paths
 from ..data.resample import resample_ohlcv
 from ..data.storage import load_raw_csv, save_processed
+from .advanced import add_advanced_indicators
 from .scaler import StandardScaler
 from .targets import normalized_log_returns, target_columns
 from .technical import OHLCV_COLUMNS, add_technical_indicators
@@ -139,6 +140,7 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
             continue
 
         feat = add_technical_indicators(ohlcv.drop(columns=["ticker"]))
+        feat = add_advanced_indicators(feat, market="moex")
         feat["ticker"] = ticker
 
         if not macro.empty:

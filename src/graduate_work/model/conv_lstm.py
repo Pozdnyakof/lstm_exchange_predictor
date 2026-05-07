@@ -14,6 +14,7 @@ from torch.nn import functional as F
 
 from ..config import ModelConfig
 from .mc_dropout import MonteCarloDropout
+from .revin import RevIN
 
 
 class ConvLstmRegressor(nn.Module):
@@ -32,6 +33,13 @@ class ConvLstmRegressor(nn.Module):
     ) -> None:
         super().__init__()
         self.causal_pad = max(cfg.conv_kernel - 1, 0)
+
+        # RevIN - адаптивная per-instance нормализация поверх StandardScaler.
+        # Снимает distribution shift между обучением и инференсом.
+        self.revin = (
+            RevIN(num_features=input_dim, affine=cfg.revin_affine)
+            if cfg.use_revin else None
+        )
 
         self.conv = nn.Conv1d(
             in_channels=input_dim,
@@ -60,6 +68,8 @@ class ConvLstmRegressor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, F) → (B, num_horizons)."""
+        if self.revin is not None:
+            x = self.revin(x)             # per-instance normalization (B, T, F)
         x = x.transpose(1, 2)            # (B, F, T)
         if self.causal_pad > 0:
             x = F.pad(x, (self.causal_pad, 0))

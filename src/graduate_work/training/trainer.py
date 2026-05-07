@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+from torch.optim.swa_utils import AveragedModel, SWALR
 from torch.utils.data import DataLoader, TensorDataset
 
 try:
@@ -102,6 +103,8 @@ class Trainer:
 
         history = TrainingHistory()
         ctx = _FitContext(history=history, patience=self.cfg.early_stopping_patience)
+        self._init_swa(ctx)
+
         outer = tqdm(
             range(1, self.cfg.epochs + 1),
             desc="Training", unit="epoch",
@@ -115,16 +118,51 @@ class Trainer:
             history.train_loss.append(train_loss)
             history.val_loss.append(val_loss)
             self._update_outer_bar(outer, epoch, train_loss, val_loss, history)
+            self._maybe_step_swa(ctx, epoch)
             stop = self._update_best(ctx, val_loss, epoch)
             if stop:
                 logger.info("Early stopping at epoch %d", epoch)
                 break
 
         outer.close()
-        if ctx.best_state is not None:
+        # SWA имеет приоритет над best_state, если был активирован.
+        if ctx.swa_active and ctx.swa_model is not None:
+            self._finalize_swa(ctx)
+        elif ctx.best_state is not None:
             self.model.load_state_dict(ctx.best_state)
         self._save_checkpoint(checkpoint_path)
         return history
+
+    def _init_swa(self, ctx: _FitContext) -> None:
+        if not self.cfg.use_swa:
+            return
+        ctx.swa_start_epoch = max(1, int(self.cfg.epochs * self.cfg.swa_start_frac))
+        ctx.swa_model = AveragedModel(self.model)
+        ctx.swa_scheduler = SWALR(self.optimizer, swa_lr=self.cfg.swa_lr)
+        logger.info("SWA enabled, start at epoch %d, swa_lr=%.4g",
+                    ctx.swa_start_epoch, self.cfg.swa_lr)
+
+    def _maybe_step_swa(self, ctx: _FitContext, epoch: int) -> None:
+        if ctx.swa_model is None or ctx.swa_scheduler is None:
+            return
+        if epoch < ctx.swa_start_epoch:
+            return
+        ctx.swa_active = True
+        ctx.swa_model.update_parameters(self.model)
+        ctx.swa_scheduler.step()
+
+    def _finalize_swa(self, ctx: _FitContext) -> None:
+        if ctx.swa_model is None:
+            return
+        # Копируем усреднённые веса в основную модель. BN-stats не
+        # пересчитываем (сеть их не использует).
+        averaged_state = {
+            k.removeprefix("module."): v.detach().clone()
+            for k, v in ctx.swa_model.state_dict().items()
+            if not k.startswith("n_averaged")
+        }
+        self.model.load_state_dict(averaged_state, strict=False)
+        logger.info("SWA finalized: averaged weights copied into model")
 
     @staticmethod
     def _update_outer_bar(
@@ -184,23 +222,26 @@ class Trainer:
             leave=False,
         )
         for x, y in bar:
-            x = x.to(self.device)
-            y = y.to(self.device)
-            with torch.set_grad_enabled(train):
-                preds = self.model(x)
-                loss = self.loss_fn(preds, y)
-                if train:
-                    self.optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    if self.cfg.grad_clip > 0:
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-                    self.optimizer.step()
-            batch_loss = float(loss.item())
+            batch_loss = self._step(x, y, train=train)
             total += batch_loss * x.shape[0]
             count += x.shape[0]
             if hasattr(bar, "set_postfix_str"):
-                bar.set_postfix_str(f"loss={total/max(count,1):.5f}")
+                bar.set_postfix_str(f"loss={total / max(count, 1):.5f}")
         return total / max(count, 1)
+
+    def _step(self, x: torch.Tensor, y: torch.Tensor, *, train: bool) -> float:
+        x = x.to(self.device)
+        y = y.to(self.device)
+        with torch.set_grad_enabled(train):
+            preds = self.model(x)
+            loss = self.loss_fn(preds, y)
+            if train:
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if self.cfg.grad_clip > 0:
+                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+                self.optimizer.step()
+        return float(loss.item())
 
 
 @dataclass
@@ -209,3 +250,9 @@ class _FitContext:
     patience: int
     bad_epochs: int = 0
     best_state: dict | None = None
+    # SWA-инфраструктура: усреднённая модель + LR-планировщик.
+    # Активируется только если cfg.use_swa и эпоха >= swa_start.
+    swa_model: AveragedModel | None = None
+    swa_scheduler: SWALR | None = None
+    swa_start_epoch: int = 0
+    swa_active: bool = False

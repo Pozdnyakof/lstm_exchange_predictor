@@ -88,6 +88,11 @@ class ModelConfig:
     lstm_layers: int = 2
     fc_hidden: int = 64
     dropout: float = 0.3
+    # Reversible Instance Normalization (Kim et al. 2022) поверх входа.
+    # Адаптивная per-instance нормализация дополняет глобальный
+    # StandardScaler и помогает при distribution shift между периодами.
+    use_revin: bool = True
+    revin_affine: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,7 +110,15 @@ class TrainingConfig:
     early_stopping_patience: int = 6
     grad_clip: float = 1.0
     seed: int = 42
-    mc_passes: int = 50
+    # 100 проходов вместо 50 - точнее оценка эпистемической
+    # неопределённости, инференс остаётся быстрым.
+    mc_passes: int = 100
+    # Stochastic Weight Averaging (Izmailov et al. 2018) - усреднение
+    # весов после swa_start_frac × epochs. Даёт более плоский минимум
+    # loss landscape и снижает дисперсию по сидам.
+    use_swa: bool = True
+    swa_start_frac: float = 0.5
+    swa_lr: float = 5e-4
 
 
 @dataclass(frozen=True)
