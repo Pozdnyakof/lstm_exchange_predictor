@@ -70,9 +70,15 @@ class DataConfig:
     extra_indexes: tuple[str, ...] = ("RGBI", "RTSI")
     brent_symbol: str = "BZ=F"  # Yahoo Finance тикер Brent
     cbr_currencies: tuple[str, ...] = ("USD", "EUR")
-    # Горизонты прогноза в барах (5-минутных): 1=5мин, 3=15мин, 6=30мин, 12=1ч.
-    horizons: tuple[int, ...] = (1, 3, 6, 12)
-    window_size: int = 48  # 4 часа контекста ~ половина торг. сессии
+    # Горизонты прогноза в барах (5-минутных):
+    # 6=30мин, 12=1ч, 24=2ч, 48=4ч.
+    # Длинные горизонты компенсируют комиссии/проскальзывание (round-trip
+    # ≈0.10%): на 4-часовой дистанции реалистичные движения легко
+    # перекрывают costs, что улучшает баланс классов в cost-aware метках.
+    horizons: tuple[int, ...] = (6, 12, 24, 48)
+    # 8 часов контекста (~1 сессия). При горизонте 4ч соотношение
+    # look-back:forecast = 2:1 — стандарт для time-series Transformer'ов.
+    window_size: int = 96
     # T2.1: per-ticker dummies как exogenous-фичи.
     use_ticker_dummies: bool = True
 
@@ -135,14 +141,14 @@ class ModelConfig:
 
     # === TimeXer-параметры (architecture="timexer") ===
     # Значения соответствуют R-0023 baseline; seq_len выровнен под
-    # window_size=48 (4 часа): patch_len=8, stride=4 -> 11 патчей.
+    # window_size=96 (8 часов): patch_len=16, stride=8 -> 11 патчей.
     timexer_d_model: int = 128
     timexer_n_layers: int = 3
     timexer_n_heads: int = 8
     timexer_d_ff: int = 256
-    timexer_patch_len: int = 8
-    timexer_stride: int = 4
-    timexer_seq_len: int = 48
+    timexer_patch_len: int = 16
+    timexer_stride: int = 8
+    timexer_seq_len: int = 96
     timexer_dropout: float = 0.3
     # n_exo=0: все каналы эндогенные (в т.ч. ticker dummies). Если
     # отделять exo (например, индексные returns) - указывается их
