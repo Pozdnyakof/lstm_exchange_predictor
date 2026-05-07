@@ -55,6 +55,10 @@ class DataConfig:
     download_batch_months: int = 3
     download_batch_retries: int = 4
     download_batch_backoff_sec: float = 5.0
+    # Параллельная загрузка тикеров. 5 - разумный компромисс: I/O-bound,
+    # MOEX ISS обычно держит, ретраи прикрывают временные блокировки.
+    # Если MOEX начал агрессивно резать - снижайте до 2-3.
+    download_workers: int = 5
     # MOEX основная сессия: 10:00 - 18:45 МСК = 07:00 - 15:45 UTC.
     session_start_utc: str = "07:00"
     session_end_utc: str = "15:45"

@@ -3,8 +3,11 @@
 Тикеры и индексы качаются батчами (`_batches.download_in_batches`):
 большой диапазон делится на ``download_batch_months`` куски, каждый чанк
 ретраится до ``download_batch_retries`` раз с экспоненциальным backoff,
-и после каждого успешного чанка CSV дописывается на диск - чтобы не
-терять прогресс при rate-limit'е MOEX.
+и после каждого успешного чанка CSV дописывается на диск.
+
+Параллельная загрузка нескольких тикеров одновременно через
+``ThreadPoolExecutor`` (количество воркеров - ``download_workers``).
+Сетевая работа MOEX ISS - I/O-bound, GIL не мешает.
 
 Сырые данные сохраняются как есть (1-минутки для MOEX). Ресэмпл к
 ``bar_minutes`` происходит ПОЗЖЕ - в `features/pipeline.py` или в
@@ -14,6 +17,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 
@@ -36,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 def _download_one_ticker(
     ticker: str, cfg: DataConfig, paths: Paths,
+    *, show_chunk_progress: bool = True,
 ) -> pd.DataFrame:
     target = paths.data_raw / "moex" / f"{ticker}.csv"
 
@@ -53,11 +59,13 @@ def _download_one_ticker(
         target_path=target,
         fetch=fetch,
         label=f"MOEX {ticker}",
+        show_chunk_progress=show_chunk_progress,
     )
 
 
 def _download_one_index(
     code: str, cfg: DataConfig, paths: Paths,
+    *, show_chunk_progress: bool = True,
 ) -> pd.DataFrame:
     target = paths.data_raw / "indexes" / f"{code}.csv"
 
@@ -75,41 +83,80 @@ def _download_one_index(
         target_path=target,
         fetch=fetch,
         label=f"MOEX index {code}",
+        show_chunk_progress=show_chunk_progress,
     )
 
 
-def download_tickers(cfg: DataConfig, paths: Paths) -> dict[str, pd.DataFrame]:
-    """Скачать сырые 1-минутные OHLCV для всех тикеров (батчами с retry)."""
+def _run_parallel(
+    items: Iterable[str],
+    worker: Callable[[str], pd.DataFrame],
+    *,
+    workers: int,
+    desc: str,
+    unit: str,
+) -> dict[str, pd.DataFrame]:
+    """Запустить ``worker(item)`` параллельно для всех ``items``.
+
+    Возвращает {item: df} только для тех, где df не пустой.
+    Падения одной задачи не убивают остальные - логгируются и
+    продолжаются.
+    """
+    items = list(items)
     out: dict[str, pd.DataFrame] = {}
-    bar = tqdm(cfg.tickers, desc="MOEX tickers", unit="ticker")
-    for ticker in bar:
-        if hasattr(bar, "set_postfix_str"):
-            bar.set_postfix_str(ticker)
-        try:
-            df = _download_one_ticker(ticker, cfg, paths)
-        except RuntimeError as exc:
-            logger.error("Skipping %s after exhausted retries: %s", ticker, exc)
-            continue
-        if not df.empty:
-            out[ticker] = df
+    bar = tqdm(total=len(items), desc=desc, unit=unit)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(worker, item): item for item in items}
+        for future in as_completed(futures):
+            item = futures[future]
+            if hasattr(bar, "set_postfix_str"):
+                bar.set_postfix_str(item)
+            try:
+                df = future.result()
+            except RuntimeError as exc:
+                logger.error("Skipping %s after exhausted retries: %s", item, exc)
+                df = pd.DataFrame()
+            except Exception:  # noqa: BLE001
+                logger.exception("Unexpected failure for %s", item)
+                df = pd.DataFrame()
+            bar.update(1)
+            if not df.empty:
+                out[item] = df
+    bar.close()
     return out
+
+
+def download_tickers(cfg: DataConfig, paths: Paths) -> dict[str, pd.DataFrame]:
+    """Скачать сырые 1-минутные OHLCV для всех тикеров параллельно."""
+    workers = max(1, cfg.download_workers)
+    parallel = workers > 1
+
+    def worker(ticker: str) -> pd.DataFrame:
+        return _download_one_ticker(
+            ticker, cfg, paths,
+            show_chunk_progress=not parallel,
+        )
+
+    return _run_parallel(
+        cfg.tickers, worker,
+        workers=workers, desc="MOEX tickers", unit="ticker",
+    )
 
 
 def download_indexes(cfg: DataConfig, paths: Paths) -> dict[str, pd.DataFrame]:
-    out: dict[str, pd.DataFrame] = {}
     codes = (cfg.base_index, *cfg.extra_indexes)
-    bar = tqdm(codes, desc="MOEX indexes", unit="index")
-    for code in bar:
-        if hasattr(bar, "set_postfix_str"):
-            bar.set_postfix_str(code)
-        try:
-            df = _download_one_index(code, cfg, paths)
-        except RuntimeError as exc:
-            logger.error("Skipping index %s after exhausted retries: %s", code, exc)
-            continue
-        if not df.empty:
-            out[code] = df
-    return out
+    workers = max(1, min(cfg.download_workers, len(codes)))
+    parallel = workers > 1
+
+    def worker(code: str) -> pd.DataFrame:
+        return _download_one_index(
+            code, cfg, paths,
+            show_chunk_progress=not parallel,
+        )
+
+    return _run_parallel(
+        codes, worker,
+        workers=workers, desc="MOEX indexes", unit="index",
+    )
 
 
 # ---------------------------------------------------------------------------
