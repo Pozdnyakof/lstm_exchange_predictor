@@ -102,3 +102,23 @@ def fetch_index(
     df = _paginated_candles(path, start=start, end=end, interval=interval)
     df["ticker"] = code
     return df
+
+
+def fetch_currency_metal(
+    secid: str,
+    *,
+    start: str,
+    end: str,
+    interval: int = 10,
+) -> pd.DataFrame:
+    """Скачать candles драг-металла или FX-пары на currency/selt-рынке.
+
+    Примеры secid: ``GLDRUB_TOM`` (золото-RUB), ``SLVRUB_TOM`` (серебро),
+    ``USD000UTSTOM`` (USDRUB). Тот же endpoint обслуживает все валютно-
+    металлические инструменты ISS. На 5-минутный интервал MOEX отдаёт
+    пустоту - используйте ``interval=10`` (или 60).
+    """
+    path = f"engines/currency/markets/selt/securities/{secid}/candles"
+    df = _paginated_candles(path, start=start, end=end, interval=interval)
+    df["ticker"] = secid
+    return df

@@ -133,6 +133,38 @@ def _load_indexes(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
     return out
 
 
+def _load_metals_fx(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
+    """Загрузить close-фрейм по интрадей металлам/FX из MOEX currency/selt.
+
+    Структура полностью аналогична `_load_indexes`: каждая бумага даёт
+    одну колонку ``mfx_<secid_lower>_close`` с float-ценами.
+    Дальше идёт через тот же `_index_log_returns` поверх сетки тикера.
+    """
+    out = pd.DataFrame()
+    if not cfg.metals_fx_codes:
+        return out
+    mfx_dir = paths.data_raw / "metals_fx"
+    if not mfx_dir.exists():
+        return out
+    for code in cfg.metals_fx_codes:
+        f = mfx_dir / f"{code}.csv"
+        if not f.exists():
+            continue
+        df = load_raw_csv(f)
+        if "close" not in df.columns:
+            continue
+        df = resample_ohlcv(df, cfg)
+        if df.empty:
+            continue
+        col = f"mfx_{code.lower()}_close"
+        close = df["close"].astype(float)
+        close.name = col
+        out = close.to_frame() if out.empty else out.join(close, how="outer")
+    if not out.empty:
+        out = out.sort_index()
+    return out
+
+
 def _index_log_returns(indexes: pd.DataFrame, target_index: pd.DatetimeIndex) -> pd.DataFrame:
     """Перевести close-фрейм индексов в log-return на сетке `target_index`.
 
@@ -190,6 +222,7 @@ def build_feature_frame(
     """Объединить тикеры с макро/индексной частью, посчитать фичи и таргеты."""
     macro = _load_macro(paths, cfg)
     indexes = _load_indexes(paths, cfg)
+    metals_fx = _load_metals_fx(paths, cfg)
 
     frames: list[pd.DataFrame] = []
     feature_cols: list[str] | None = None
@@ -217,6 +250,11 @@ def build_feature_frame(
             # автокорреляции в фиче.
             idx_logret = _index_log_returns(indexes, feat.index)
             feat = pd.concat([feat, idx_logret], axis=1)
+        if not metals_fx.empty:
+            # Тот же механизм для интрадей-золота/USDRUB: log_return на
+            # сетке тикера — прямые драйверы выручки экспортёров.
+            mfx_logret = _index_log_returns(metals_fx, feat.index)
+            feat = pd.concat([feat, mfx_logret], axis=1)
 
         targets = _build_targets(feat, cfg, trading_cfg)
         feat = pd.concat([feat, targets], axis=1)

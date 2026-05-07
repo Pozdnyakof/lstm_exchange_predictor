@@ -159,6 +159,49 @@ def download_indexes(cfg: DataConfig, paths: Paths) -> dict[str, pd.DataFrame]:
     )
 
 
+def _download_one_metal_fx(
+    secid: str, cfg: DataConfig, paths: Paths,
+    *, show_chunk_progress: bool = True,
+) -> pd.DataFrame:
+    target = paths.data_raw / "metals_fx" / f"{secid}.csv"
+
+    def fetch(s: str, e: str) -> pd.DataFrame:
+        return moex_iss.fetch_currency_metal(
+            secid, start=s, end=e, interval=cfg.metals_fx_interval,
+        )
+
+    return download_in_batches(
+        start=cfg.start_date,
+        end=cfg.end_date,
+        batch_months=cfg.download_batch_months,
+        retries=cfg.download_batch_retries,
+        backoff_sec=cfg.download_batch_backoff_sec,
+        target_path=target,
+        fetch=fetch,
+        label=f"MOEX metal/FX {secid}",
+        show_chunk_progress=show_chunk_progress,
+    )
+
+
+def download_metals_fx(cfg: DataConfig, paths: Paths) -> dict[str, pd.DataFrame]:
+    codes = tuple(cfg.metals_fx_codes)
+    if not codes:
+        return {}
+    workers = max(1, min(cfg.download_workers, len(codes)))
+    parallel = workers > 1
+
+    def worker(code: str) -> pd.DataFrame:
+        return _download_one_metal_fx(
+            code, cfg, paths,
+            show_chunk_progress=not parallel,
+        )
+
+    return _run_parallel(
+        codes, worker,
+        workers=workers, desc="MOEX metals/FX", unit="instr",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Macro - объёмы небольшие, без батчирования
 # ---------------------------------------------------------------------------
@@ -219,4 +262,5 @@ def download_all(cfg: DataConfig, paths: Paths) -> None:
     paths.ensure()
     download_tickers(cfg, paths)
     download_indexes(cfg, paths)
+    download_metals_fx(cfg, paths)
     download_macro(cfg, paths)
