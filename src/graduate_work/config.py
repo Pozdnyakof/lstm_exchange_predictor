@@ -39,17 +39,39 @@ class DataConfig:
     # и ускоряет обучение. CSV всех 30 тикеров остаются на диске и Drive,
     # для перерасчёта/расширения список можно вернуть к полному (см. ниже).
     tickers: tuple[str, ...] = (
-        "MTLR", "SMLT", "VTBR", "AFLT", "GAZP",
+        # Голубые фишки IMOEX
+        "SBER",
+        "GAZP",
+        "LKOH",
+        "GMKN",
+        "ROSN",
+        "NVTK",
+        "MTSS",
+        "MGNT",
+        "PLZL",
+        "TATN",
+        "CHMF",
+        "ALRS",
+        "SNGS",
+        "YDEX",
+        # Расширение - ликвидные бумаги с историей с 2022-09
+        "VTBR",
+        "MOEX",
+        "PIKK",
+        "PHOR",
+        "AFKS",
+        "HYDR",
+        "IRAO",
+        "RUAL",
+        "NLMK",
+        "MAGN",
+        "AFLT",
+        "SIBN",
+        "RTKM",
+        "MTLR",
+        "FLOT",
+        "SMLT",
     )
-    # Полный список 30 тикеров (для отката):
-    # tickers = (
-    #     "SBER", "GAZP", "LKOH", "GMKN", "ROSN", "NVTK",
-    #     "MTSS", "MGNT", "PLZL", "TATN", "CHMF", "ALRS",
-    #     "SNGS", "YDEX",
-    #     "VTBR", "MOEX", "PIKK", "PHOR", "AFKS", "HYDR",
-    #     "IRAO", "RUAL", "NLMK", "MAGN", "AFLT", "SIBN",
-    #     "RTKM", "MTLR", "FLOT", "SMLT",
-    # )
     start_date: str = "2020-01-01"
     end_date: str = "2026-01-01"
     # MOEX ISS поддерживает интервалы 1, 10, 60, 24, 7, 31. Качаем 1-мин и
@@ -81,7 +103,7 @@ class DataConfig:
     cbr_currencies: tuple[str, ...] = ("USD", "EUR")
     # Горизонты прогноза в барах (5-минутных): 1=5мин, 3=15мин, 6=30мин, 12=1ч.
     horizons: tuple[int, ...] = (1, 3, 6, 12)
-    window_size: int = 48           # 4 часа контекста ~ половина торг. сессии
+    window_size: int = 48  # 4 часа контекста ~ половина торг. сессии
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
@@ -126,7 +148,7 @@ class TrainingConfig:
     На T4 (16 GB VRAM) рекомендуется снизить batch_size до 256-512.
     """
 
-    batch_size: int = 2048           # L4 легко выдерживает 2-4K при window=30
+    batch_size: int = 2048  # L4 легко выдерживает 2-4K при window=30
     epochs: int = 40
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
@@ -154,9 +176,9 @@ class TradingConfig:
     # зафиксированы на нуле для чистого сравнения с random monkeys.
     commission_rate: float = 0.0
     slippage_rate: float = 0.0
-    max_positions: int = 5            # сколько активов держим одновременно
-    min_expected_return: float = 0.0005   # порог по среднему MC прогнозу
-    max_uncertainty: float = 0.02         # порог по std MC прогноза
+    max_positions: int = 5  # сколько активов держим одновременно
+    min_expected_return: float = 0.0005  # порог по среднему MC прогнозу
+    max_uncertainty: float = 0.02  # порог по std MC прогноза
     # Случайные портфели:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0
@@ -166,11 +188,15 @@ class TradingConfig:
 class ServingConfig:
     """Параметры live-инференса (модуль 5)."""
 
-    refresh_interval_sec: int = 900       # как часто фоновый scheduler обновляет кэш
-    live_buffer_days: int = 60            # сколько дополнительных дней качать (запас под индикаторы)
-    moex_request_pause: float = 0.2       # троттлинг между запросами к MOEX ISS
-    alert_min_strength: float = 2.0       # min mean / std (signal-to-noise) для алерта
-    cache_ttl_sec: int = 300              # TTL кэша price-окон в памяти
+    refresh_interval_sec: int = 900  # как часто фоновый scheduler обновляет кэш
+    live_buffer_days: int = (
+        60  # сколько дополнительных дней качать (запас под индикаторы)
+    )
+    moex_request_pause: float = 0.2  # троттлинг между запросами к MOEX ISS
+    alert_min_strength: float = (
+        2.0  # min mean / std (signal-to-noise) для алерта
+    )
+    cache_ttl_sec: int = 300  # TTL кэша price-окон в памяти
 
 
 @dataclass
