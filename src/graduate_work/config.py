@@ -73,6 +73,10 @@ class DataConfig:
     # Горизонты прогноза в барах (5-минутных): 1=5мин, 3=15мин, 6=30мин, 12=1ч.
     horizons: tuple[int, ...] = (1, 3, 6, 12)
     window_size: int = 48  # 4 часа контекста ~ половина торг. сессии
+    # T2.1: per-ticker dummies как exogenous-фичи. Один общий регрессор
+    # на 12 разных тикерах усредняет поведение; one-hot позволяет модели
+    # специализироваться без отдельных моделей.
+    use_ticker_dummies: bool = True
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
@@ -133,6 +137,13 @@ class TrainingConfig:
     use_swa: bool = True
     swa_start_frac: float = 0.5
     swa_lr: float = 5e-4
+    # T1.2: Huber-δ автоматически вычисляется из распределения таргетов
+    # (≈ 2 × median(|y_train|)). Защищает от ошибки когда δ=1.0 слишком
+    # большой для нормализованных лог-доходностей масштаба ~1e-3.
+    huber_delta_auto: bool = True
+    # T2.2: AdamW + CosineAnnealing вместо плоского Adam.
+    optimizer: str = "adamw"     # adam | adamw
+    scheduler: str = "cosine"    # none | cosine
 
 
 @dataclass(frozen=True)
@@ -140,14 +151,24 @@ class TradingConfig:
     """Торговые ограничения и пороги фильтрации."""
 
     initial_capital: float = 1_000_000.0
-    # Параметры транзакционных издержек оставлены в инфраструктуре
-    # учёта (engine, random_portfolios), но в текущем эксперименте
-    # зафиксированы на нуле для чистого сравнения с random monkeys.
-    commission_rate: float = 0.0
-    slippage_rate: float = 0.0
+    # Реалистичные транзакционные издержки на MOEX:
+    # - брокерская комиссия ~0.03% за сторону (типично для розничных тарифов)
+    # - проскальзывание ~0.02% (либералиновая для высоколиквидных топов)
+    # Round-trip ≈ 0.10%, что соответствует §2.2 ВКР про «эмулирует
+    # исполнение заявки с учётом реальных брокерских комиссий и
+    # проскальзывания». Random monkeys учитывают те же издержки симметрично.
+    commission_rate: float = 0.0003
+    slippage_rate: float = 0.0002
     max_positions: int = 5  # сколько активов держим одновременно
     min_expected_return: float = 0.0005  # порог по среднему MC прогнозу
     max_uncertainty: float = 0.02  # порог по std MC прогноза
+    # T2.3: Bonferroni-style коррекция при выборе argmax-горизонта.
+    # При выборе MAX из N независимых сигналов (по горизонтам) под H0
+    # ожидаемая величина растёт как ~σ·sqrt(2·ln(N)). Поэтому требуем
+    # mean ≥ min_expected_return × bonferroni_factor.
+    # Для N=4: 1/Φ⁻¹(1 - 0.05/4) ≈ 1.65σ → 2.24σ ⇒ factor ≈ 1.36.
+    # Используем 1.5 как умеренно консервативный.
+    horizon_argmax_correction: float = 1.5
     # Случайные портфели:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0

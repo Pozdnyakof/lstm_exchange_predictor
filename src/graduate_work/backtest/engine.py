@@ -104,10 +104,19 @@ def run_backtest(
             if pos["close_date"] == day:
                 exit_price = lookup.get((day, pos["ticker"]))
                 if exit_price is None:
-                    # Нет данных - продлеваем на следующий день.
-                    pos["close_date"] = day + pd.Timedelta(days=1)
-                    still_open.append(pos)
-                    continue
+                    # Нет данных по этому тикеру в этом баре - продлеваем
+                    # на СЛЕДУЮЩИЙ БАР календаря (не на сутки!). При
+                    # 5-минутном таймфрейме старая логика days=1 добавляла
+                    # 24 часа stale-экспозиции, искажая PnL.
+                    cur_idx = bar_index.get(day)
+                    if cur_idx is None or cur_idx + 1 >= len(trading_days):
+                        # Конец тестового окна - закрываем по entry-цене
+                        # (нулевой PnL), чтобы не тащить позицию вечно.
+                        exit_price = pos["entry_price"]
+                    else:
+                        pos["close_date"] = trading_days[cur_idx + 1]
+                        still_open.append(pos)
+                        continue
                 gross = pos["quantity"] * exit_price
                 fees = gross * cost_close
                 proceeds = gross - fees

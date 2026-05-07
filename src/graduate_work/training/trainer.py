@@ -81,12 +81,17 @@ class Trainer:
             device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"),
         )
         self.model = model.to(self.device)
-        self.optimizer = torch.optim.Adam(
+        opt_cls = torch.optim.AdamW if cfg.optimizer == "adamw" else torch.optim.Adam
+        self.optimizer = opt_cls(
             self.model.parameters(),
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )
+        # δ Huber-loss подбирается на основе распределения таргетов (см. fit()).
+        # До первого fit() ставим консервативный дефолт.
         self.loss_fn = nn.HuberLoss(reduction="mean", delta=1.0)
+        # CosineAnnealing-планировщик опционально (cfg.scheduler).
+        self.lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
 
     def fit(
         self,
@@ -100,6 +105,25 @@ class Trainer:
         if train_loader is None:
             msg = "Training set is empty"
             raise ValueError(msg)
+
+        # T1.2: δ Huber подбираем по масштабу таргетов. Иначе при δ=1.0
+        # и таргете масштаба 1e-3 функция эффективно становится MSE, и
+        # модель сходится к предсказанию нуля.
+        if self.cfg.huber_delta_auto:
+            y_train = train_arrays["y"]
+            if y_train.size > 0:
+                delta = max(2.0 * float(np.median(np.abs(y_train))), 1e-4)
+                self.loss_fn = nn.HuberLoss(reduction="mean", delta=delta)
+                logger.info("Auto Huber-delta: %.5g (from train target scale)", delta)
+
+        # T2.2: CosineAnnealingLR-планировщик. Длится все epochs;
+        # при early stopping просто прерывается на полпути.
+        if self.cfg.scheduler == "cosine":
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, self.cfg.epochs),
+                eta_min=self.cfg.learning_rate * 0.01,
+            )
 
         history = TrainingHistory()
         ctx = _FitContext(history=history, patience=self.cfg.early_stopping_patience)
@@ -144,9 +168,16 @@ class Trainer:
 
     def _maybe_step_swa(self, ctx: _FitContext, epoch: int) -> None:
         if ctx.swa_model is None or ctx.swa_scheduler is None:
+            # SWA выключен → шагаем обычным cosine scheduler.
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
             return
         if epoch < ctx.swa_start_epoch:
+            # Пока не активен SWA - шагает основной cosine scheduler.
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
             return
+        # SWA-фаза: используем SWALR, обычный scheduler не трогаем.
         ctx.swa_active = True
         ctx.swa_model.update_parameters(self.model)
         ctx.swa_scheduler.step()

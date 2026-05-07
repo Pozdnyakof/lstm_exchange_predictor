@@ -79,6 +79,14 @@ class SignalGenerator:
                 columns=["timestamp", "ticker", "horizon", "mean", "std", "action"],
             )
         best = self.best_per_ticker(predictions)
+        # T2.3: Bonferroni-style коррекция за argmax-выбор горизонта.
+        # При выборе MAX из N горизонтов нулевая гипотеза даёт смещение,
+        # компенсируемое умножением порога на factor.
+        n_horizons = predictions["horizon"].nunique() if not predictions.empty else 1
+        correction = (
+            self.cfg.horizon_argmax_correction if n_horizons > 1 else 1.0
+        )
+        effective_threshold = self.cfg.min_expected_return * correction
         sessions: list[pd.DataFrame] = []
         for ts, day in best.groupby("timestamp", sort=True):
             day = day.copy()
@@ -92,7 +100,7 @@ class SignalGenerator:
             day["action"] = "HOLD"
             top = day.head(self.cfg.max_positions).copy()
             qualifying = (
-                (top["mean"] >= self.cfg.min_expected_return)
+                (top["mean"] >= effective_threshold)
                 & (top["std"] <= self.cfg.max_uncertainty)
             )
             day.loc[top.index[qualifying], "action"] = "BUY"

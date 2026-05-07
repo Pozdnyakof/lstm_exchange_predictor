@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -33,7 +34,12 @@ from graduate_work.config import default_config
 from graduate_work.data.storage import load_processed
 from graduate_work.features import build_dataset
 from graduate_work.serving import load_artifact
-from graduate_work.strategy import SignalGenerator, build_predictions_frame
+from graduate_work.strategy import (
+    SignalGenerator,
+    attach_actual_targets,
+    build_predictions_frame,
+    calibrate_min_expected_return,
+)
 from graduate_work.training import mc_predict
 
 
@@ -82,8 +88,42 @@ def main() -> None:
         horizons=horizons,
     )
 
-    # 4) Двухступенчатый фильтр.
-    signals = SignalGenerator(cfg.trading).generate(predictions)
+    # 4) T1.4: калибровка порога min_expected_return на val.
+    val = prepared.val
+    if val["x"].shape[0] > 0:
+        val_mean, val_std = mc_predict(
+            loaded.model, val["x"],
+            mc_passes=cfg.training.mc_passes,
+            batch_size=cfg.training.batch_size,
+            device="cpu",
+        )
+        val_predictions = build_predictions_frame(
+            timestamps=val["timestamp"],
+            tickers=val["ticker"],
+            mean=val_mean,
+            std=val_std,
+            horizons=horizons,
+        )
+        val_targets = attach_actual_targets(val, horizons)
+        cost_per_trade = 2.0 * (cfg.trading.commission_rate + cfg.trading.slippage_rate)
+        calib = calibrate_min_expected_return(
+            val_predictions, val_targets,
+            cost_per_trade=cost_per_trade,
+        )
+        logging.info(
+            "Calibrated threshold: T=%.5g (val signals=%d, avg=%.5g, wr=%.3f)",
+            calib.min_expected_return, calib.n_val_signals,
+            calib.val_avg_return, calib.val_win_rate,
+        )
+        trading_cfg = dataclasses.replace(
+            cfg.trading,
+            min_expected_return=calib.min_expected_return,
+        )
+    else:
+        trading_cfg = cfg.trading
+
+    # Двухступенчатый фильтр (с откалиброванным порогом).
+    signals = SignalGenerator(trading_cfg).generate(predictions)
 
     # 5) Цены тестового периода + buffer на хвостовые позиции.
     full_path = cfg.paths.data_processed / "features.parquet"
@@ -101,14 +141,14 @@ def main() -> None:
     )
 
     # 6) Aggregate бэктест.
-    bt = run_backtest(signals, test_prices, cfg.trading)
+    bt = run_backtest(signals, test_prices, trading_cfg)
     bars_per_year = cfg.data.bars_per_year
     metrics = compute_metrics(bt.equity, bt.trades, periods_per_year=bars_per_year)
     logging.info("Aggregate metrics: %s", metrics)
 
     # 7) Per-ticker бэктест.
     per_ticker = run_per_ticker_backtest(
-        signals, test_prices, cfg.trading,
+        signals, test_prices, trading_cfg,
         periods_per_year=bars_per_year,
     )
     logging.info(
@@ -128,7 +168,7 @@ def main() -> None:
     n_buy = int((signals["action"] == "BUY").sum())
     n_bars = int(len(test_prices.index.unique()))
     trade_prob = (
-        max(min(n_buy / max(n_bars * cfg.trading.max_positions, 1), 1.0), 1e-4)
+        max(min(n_buy / max(n_bars * trading_cfg.max_positions, 1), 1.0), 1e-4)
         if n_buy > 0 else 0.05
     )
     logging.info(
@@ -137,7 +177,7 @@ def main() -> None:
     )
     random_report = run_random_portfolios(
         test_prices,
-        cfg.trading,
+        trading_cfg,
         avg_horizon=avg_h,
         trade_probability=trade_prob,
         strategy_final=metrics["final_equity"],
@@ -173,7 +213,7 @@ def main() -> None:
             "strategy_final": random_report.strategy_final,
             "strategy_z_score": random_report.strategy_z_score,
             "is_significant": bool(random_report.is_significant),
-            "initial_capital": cfg.trading.initial_capital,
+            "initial_capital": trading_cfg.initial_capital,
             "final_returns": random_report.final_returns.tolist(),
         },
     )

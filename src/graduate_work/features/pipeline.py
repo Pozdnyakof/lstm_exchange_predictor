@@ -194,6 +194,16 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
         raise RuntimeError(msg)
 
     full = pd.concat(frames, axis=0).sort_index()
+
+    # T2.1: per-ticker one-hot dummies. Один общий регрессор на нескольких
+    # тикерах усредняет их поведение; dummies позволяют модели специализи-
+    # роваться на каждом инструменте без обучения N отдельных моделей.
+    if cfg.use_ticker_dummies:
+        dummies = pd.get_dummies(full["ticker"], prefix="tid", dtype=float)
+        full = pd.concat([full, dummies], axis=1)
+        if feature_cols is not None:
+            feature_cols = list(feature_cols) + list(dummies.columns)
+
     return full, feature_cols  # type: ignore[return-value]
 
 
