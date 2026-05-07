@@ -150,6 +150,20 @@ class ModelConfig:
     lstm_hidden: int = 128
     lstm_layers: int = 2
 
+    # === DLinear / NLinear параметры (architecture="dlinear" | "nlinear") ===
+    # DLinear / NLinear (Zeng et al., AAAI 2023) — простые baseline'ы,
+    # часто превосходят трансформеры на коротких многомерных рядах.
+    linear_seq_len: int = 384            # выровнено с window_size
+    linear_kernel_size: int = 25         # для DLinear: окно скользящего среднего
+
+    # === MOMENT (architecture="moment") ===
+    # Foundation model AutonLab/MOMENT-1 (ICML 2024). Encoder заморожен,
+    # обучается только голова. Требует pip install momentfm.
+    # Доступные чекпоинты: AutonLab/MOMENT-1-small (40M params, d=512),
+    #                      AutonLab/MOMENT-1-base  (125M, d=768),
+    #                      AutonLab/MOMENT-1-large (340M, d=1024).
+    moment_checkpoint: str = "AutonLab/MOMENT-1-base"
+
     # === TimeXer-параметры (architecture="timexer") ===
     # Значения соответствуют R-0023 baseline; seq_len выровнен под
     # window_size=384 (32 часа): patch_len=48, stride=24 -> 15 патчей,
