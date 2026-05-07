@@ -47,7 +47,12 @@ class DataConfig:
     # ресэмплируем до bar_minutes - так получаем любой целевой таймфрейм
     # без отдельного API.
     moex_interval: int = 1
-    bar_minutes: int = 15
+    # Целевой таймфрейм после ресэмпла. 1440 = дневные бары (1 бар = 1
+    # торговая сессия MOEX), что соответствует горизонтам ВКР §1.2
+    # ("1 день, 5 дней, 10 дней, 20 дней" удержания позиции).
+    # Сырые данные на диске - 1-минутные, ресэмплинг происходит при
+    # построении признаков и в live-режиме.
+    bar_minutes: int = 1440
     # Батчирование загрузки: качаем по download_batch_months месяцев за раз,
     # сохраняем CSV после каждого батча, чтобы при сбое MOEX-сессии или
     # rate-limit не потерять прогресс. На каждый батч - download_batch_retries
@@ -66,9 +71,10 @@ class DataConfig:
     extra_indexes: tuple[str, ...] = ("RGBI", "RTSI")
     brent_symbol: str = "BZ=F"  # Yahoo Finance тикер Brent
     cbr_currencies: tuple[str, ...] = ("USD", "EUR")
-    # Горизонты в барах (15-минутных): 1=15мин, 4=1ч, 16=4ч, 32≈торг.день.
-    horizons: tuple[int, ...] = (1, 4, 16, 32)
-    window_size: int = 64           # ~2 торговые сессии контекста
+    # Горизонты прогноза в торговых днях - соответствуют §1.2 ВКР.
+    # При bar_minutes=1440 это эквивалентно числу баров.
+    horizons: tuple[int, ...] = (1, 5, 10, 20)
+    window_size: int = 30           # 30 торг. дней контекста (~1.5 мес.)
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
@@ -88,9 +94,13 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    """Параметры обучения."""
+    """Параметры обучения.
 
-    batch_size: int = 64
+    Параметры по умолчанию рассчитаны на L4 (40 GB VRAM) / Colab Pro+.
+    На T4 (16 GB VRAM) рекомендуется снизить batch_size до 256-512.
+    """
+
+    batch_size: int = 2048           # L4 легко выдерживает 2-4K при window=30
     epochs: int = 40
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5

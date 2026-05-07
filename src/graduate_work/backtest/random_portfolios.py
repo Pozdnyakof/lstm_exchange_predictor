@@ -11,10 +11,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm в зависимостях
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
 
 from ..config import TradingConfig
 
@@ -147,7 +152,7 @@ def run_random_portfolios(
 
     rng = np.random.default_rng(seed)
     finals = np.empty(n, dtype=np.float64)
-    for i in range(n):
+    for i in tqdm(range(n), desc="Random portfolios", unit="agent"):
         finals[i] = _simulate_one(
             rng,
             calendar=calendar,

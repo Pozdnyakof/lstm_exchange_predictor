@@ -13,6 +13,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm в зависимостях
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
+
 from ..config import TrainingConfig
 
 logger = logging.getLogger(__name__)
@@ -95,49 +101,89 @@ class Trainer:
             raise ValueError(msg)
 
         history = TrainingHistory()
-        best_state: dict | None = None
-        patience = self.cfg.early_stopping_patience
-        bad_epochs = 0
-
-        for epoch in range(1, self.cfg.epochs + 1):
-            train_loss = self._epoch(train_loader, train=True)
-            val_loss = self._epoch(val_loader, train=False) if val_loader else math.nan
-
+        ctx = _FitContext(history=history, patience=self.cfg.early_stopping_patience)
+        outer = tqdm(
+            range(1, self.cfg.epochs + 1),
+            desc="Training", unit="epoch",
+        )
+        for epoch in outer:
+            train_loss = self._epoch(train_loader, train=True, epoch=epoch, phase="train")
+            val_loss = (
+                self._epoch(val_loader, train=False, epoch=epoch, phase="val")
+                if val_loader else math.nan
+            )
             history.train_loss.append(train_loss)
             history.val_loss.append(val_loss)
-            logger.info(
-                "epoch=%03d  train_loss=%.6f  val_loss=%.6f",
-                epoch, train_loss, val_loss,
-            )
+            self._update_outer_bar(outer, epoch, train_loss, val_loss, history)
+            stop = self._update_best(ctx, val_loss, epoch)
+            if stop:
+                logger.info("Early stopping at epoch %d", epoch)
+                break
 
-            if not math.isnan(val_loss) and val_loss < history.best_val_loss - 1e-6:
-                history.best_val_loss = val_loss
-                history.best_epoch = epoch
-                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                bad_epochs = 0
-            else:
-                bad_epochs += 1
-                if bad_epochs >= patience:
-                    logger.info("Early stopping at epoch %d", epoch)
-                    break
-
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
-
-        if checkpoint_path is not None:
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(self.model.state_dict(), checkpoint_path)
-            logger.info("Saved checkpoint to %s", checkpoint_path)
-
+        outer.close()
+        if ctx.best_state is not None:
+            self.model.load_state_dict(ctx.best_state)
+        self._save_checkpoint(checkpoint_path)
         return history
 
-    def _epoch(self, loader: DataLoader | None, *, train: bool) -> float:
+    @staticmethod
+    def _update_outer_bar(
+        bar, epoch: int, train_loss: float, val_loss: float, history: TrainingHistory,
+    ) -> None:
+        if not hasattr(bar, "set_postfix"):
+            return
+        bar.set_postfix(
+            train=f"{train_loss:.5f}",
+            val=f"{val_loss:.5f}",
+            best=f"e{history.best_epoch}={history.best_val_loss:.5f}",
+        )
+
+    def _update_best(
+        self, ctx: "_FitContext", val_loss: float, epoch: int,
+    ) -> bool:
+        improved = (
+            not math.isnan(val_loss)
+            and val_loss < ctx.history.best_val_loss - 1e-6
+        )
+        if improved:
+            ctx.history.best_val_loss = val_loss
+            ctx.history.best_epoch = epoch
+            ctx.best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in self.model.state_dict().items()
+            }
+            ctx.bad_epochs = 0
+            return False
+        ctx.bad_epochs += 1
+        return ctx.bad_epochs >= ctx.patience
+
+    def _save_checkpoint(self, checkpoint_path: Path | None) -> None:
+        if checkpoint_path is None:
+            return
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), checkpoint_path)
+        logger.info("Saved checkpoint to %s", checkpoint_path)
+
+    def _epoch(
+        self,
+        loader: DataLoader | None,
+        *,
+        train: bool,
+        epoch: int,
+        phase: str,
+    ) -> float:
         if loader is None:
             return math.nan
         self.model.train(train)
         total = 0.0
         count = 0
-        for x, y in loader:
+        bar = tqdm(
+            loader,
+            desc=f"  ep{epoch:02d} {phase}",
+            unit="batch",
+            leave=False,
+        )
+        for x, y in bar:
             x = x.to(self.device)
             y = y.to(self.device)
             with torch.set_grad_enabled(train):
@@ -149,6 +195,17 @@ class Trainer:
                     if self.cfg.grad_clip > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
                     self.optimizer.step()
-            total += float(loss.item()) * x.shape[0]
+            batch_loss = float(loss.item())
+            total += batch_loss * x.shape[0]
             count += x.shape[0]
+            if hasattr(bar, "set_postfix_str"):
+                bar.set_postfix_str(f"loss={total/max(count,1):.5f}")
         return total / max(count, 1)
+
+
+@dataclass
+class _FitContext:
+    history: TrainingHistory
+    patience: int
+    bad_epochs: int = 0
+    best_state: dict | None = None

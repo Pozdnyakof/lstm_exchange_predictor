@@ -10,6 +10,12 @@ import numpy as np
 import torch
 from torch import nn
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm в зависимостях
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
+
 from ..model.mc_dropout import set_mc_dropout
 
 
@@ -43,10 +49,11 @@ def mc_predict(
     try:
         tensor_x = torch.from_numpy(x).float()
         all_passes: list[np.ndarray] = []
-        for _ in range(mc_passes):
+        passes_bar = tqdm(range(mc_passes), desc="MC passes", unit="pass", leave=False)
+        for _ in passes_bar:
             preds: list[np.ndarray] = []
             for start in range(0, tensor_x.shape[0], batch_size):
-                batch = tensor_x[start : start + batch_size].to(target_device)
+                batch = tensor_x[start:start + batch_size].to(target_device)
                 preds.append(model(batch).detach().cpu().numpy())
             all_passes.append(np.concatenate(preds, axis=0))
         stacked = np.stack(all_passes, axis=0)   # (P, N, H)

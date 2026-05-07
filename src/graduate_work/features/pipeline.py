@@ -9,6 +9,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm в зависимостях
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
+
 from ..config import DataConfig, Paths
 from ..data.resample import resample_ohlcv
 from ..data.storage import load_raw_csv, save_processed
@@ -122,7 +128,10 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
     frames: list[pd.DataFrame] = []
     feature_cols: list[str] | None = None
 
-    for ticker in cfg.tickers:
+    bar = tqdm(cfg.tickers, desc="Building features", unit="ticker")
+    for ticker in bar:
+        if hasattr(bar, "set_postfix_str"):
+            bar.set_postfix_str(ticker)
         try:
             ohlcv = _load_ticker_csv(paths, ticker, cfg)
         except FileNotFoundError as exc:
@@ -188,12 +197,18 @@ def _build_arrays(
     feature_cols: list[str],
     target_cols: list[str],
     window: int,
+    *,
+    desc: str = "windows",
 ) -> dict[str, np.ndarray]:
     xs: list[np.ndarray] = []
     ys: list[np.ndarray] = []
     ts: list[np.ndarray] = []
     tickers: list[np.ndarray] = []
-    for ticker, sub in df.groupby("ticker", sort=False):
+    groups = list(df.groupby("ticker", sort=False))
+    bar = tqdm(groups, desc=desc, unit="ticker", leave=False)
+    for ticker, sub in bar:
+        if hasattr(bar, "set_postfix_str"):
+            bar.set_postfix_str(str(ticker))
         x, y, t = make_sliding_windows(sub, feature_cols, target_cols, window)
         if x.shape[0] == 0:
             continue
@@ -241,9 +256,9 @@ def build_dataset(
         feature_cols=feature_cols,
         target_cols=target_cols,
         scaler=scaler,
-        train=_build_arrays(train_df, feature_cols, target_cols, cfg.window_size),
-        val=_build_arrays(val_df, feature_cols, target_cols, cfg.window_size),
-        test=_build_arrays(test_df, feature_cols, target_cols, cfg.window_size),
+        train=_build_arrays(train_df, feature_cols, target_cols, cfg.window_size, desc="train windows"),
+        val=_build_arrays(val_df, feature_cols, target_cols, cfg.window_size, desc="val windows"),
+        test=_build_arrays(test_df, feature_cols, target_cols, cfg.window_size, desc="test windows"),
         full_frame=full,
     )
 

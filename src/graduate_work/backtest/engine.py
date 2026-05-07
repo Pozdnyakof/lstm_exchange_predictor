@@ -12,8 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
 import pandas as pd
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm в зависимостях
+    def tqdm(it, **kw):  # type: ignore[no-redef]
+        return it
 
 from ..config import TradingConfig
 
@@ -89,7 +94,7 @@ def run_backtest(
     buy_signals = signals[signals["action"] == "BUY"]
     grouped = dict(tuple(buy_signals.groupby("timestamp", sort=True)))
 
-    for day in trading_days:
+    for day in tqdm(trading_days, desc="Backtest", unit="bar", leave=False):
         # 1) Закрываем позиции, у которых сегодня дата выхода.
         still_open: list[dict] = []
         for pos in open_positions:

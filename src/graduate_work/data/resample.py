@@ -30,6 +30,32 @@ def filter_moex_session(df: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
     return df.loc[mask]
 
 
+_OHLCV_AGG = {
+    "open": "first",
+    "high": "max",
+    "low": "min",
+    "close": "last",
+    "volume": "sum",
+    "ticker": "first",
+}
+
+
+def _resample_rule(bar_minutes: int) -> str:
+    """Преобразовать минутный шаг в pandas-rule.
+
+    Для bar_minutes >= 1440 (день) используем правило "1D" - оно явно
+    привязано к календарному дню. Иначе - "Nmin".
+    """
+    if bar_minutes >= 1440:
+        return "1D"
+    return f"{bar_minutes}min"
+
+
+def _select_agg(df: pd.DataFrame) -> dict[str, str]:
+    """Подмножество OHLCV-агрегаций для колонок, реально присутствующих в df."""
+    return {col: how for col, how in _OHLCV_AGG.items() if col in df.columns}
+
+
 def resample_ohlcv(
     df: pd.DataFrame,
     cfg: DataConfig,
@@ -40,6 +66,8 @@ def resample_ohlcv(
 
     Колонки `ticker` и прочие нечисловые сохраняются (берётся first).
     Если bar_minutes == 1, возвращаем (отфильтрованный) исходник без агрегации.
+    Для bar_minutes >= 1440 используется правило "1D" - один бар на
+    календарный день (после session-фильтра - один бар на торговый день).
     """
     if df.empty:
         return df
@@ -49,20 +77,8 @@ def resample_ohlcv(
     if df.empty or cfg.bar_minutes <= 1:
         return df
 
-    rule = f"{cfg.bar_minutes}min"
-    agg: dict[str, str] = {}
-    if "open" in df.columns:
-        agg["open"] = "first"
-    if "high" in df.columns:
-        agg["high"] = "max"
-    if "low" in df.columns:
-        agg["low"] = "min"
-    if "close" in df.columns:
-        agg["close"] = "last"
-    if "volume" in df.columns:
-        agg["volume"] = "sum"
-    if "ticker" in df.columns:
-        agg["ticker"] = "first"
+    rule = _resample_rule(cfg.bar_minutes)
+    agg = _select_agg(df)
     if not agg:
         return df
 

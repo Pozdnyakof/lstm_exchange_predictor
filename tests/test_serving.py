@@ -121,7 +121,7 @@ def test_live_feature_builder_window_shape(tmp_path: Path) -> None:
     serving_cfg = ServingConfig(cache_ttl_sec=10, moex_request_pause=0.0)
     builder = LiveFeatureBuilder(loaded, data_cfg, serving_cfg)
 
-    fake = _fake_moex_response(rows=5000)
+    fake = _fake_moex_response(rows=80000)
     with patch("graduate_work.serving.live_features.moex_iss.fetch_ticker", return_value=fake):
         win = builder.get_window("SBER", force_refresh=True)
 
@@ -151,8 +151,8 @@ def test_inference_service_returns_forecast(tmp_path: Path) -> None:
     service = InferenceService(loaded, data_cfg, trading_cfg, serving_cfg)
 
     fakes = {
-        "SBER": _fake_moex_response(rows=5000, ticker="SBER"),
-        "GAZP": _fake_moex_response(rows=5000, ticker="GAZP"),
+        "SBER": _fake_moex_response(rows=80000, ticker="SBER"),
+        "GAZP": _fake_moex_response(rows=80000, ticker="GAZP"),
     }
     with patch(
         "graduate_work.serving.live_features.moex_iss.fetch_ticker",
