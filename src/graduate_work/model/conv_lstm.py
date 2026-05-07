@@ -50,15 +50,29 @@ class ConvLstmRegressor(nn.Module):
         self.conv_act = nn.GELU()
         self.conv_drop = MonteCarloDropout(cfg.dropout)
 
-        self.lstm = nn.LSTM(
-            input_size=cfg.conv_channels,
-            hidden_size=cfg.lstm_hidden,
-            num_layers=cfg.lstm_layers,
-            batch_first=True,
-            dropout=cfg.dropout if cfg.lstm_layers > 1 else 0.0,
-        )
-        self.lstm_drop = MonteCarloDropout(cfg.dropout)
-
+        # Стек 1-слойных LSTM с явным MC Dropout между ними.
+        # Это нужно потому, что встроенный nn.LSTM(dropout=p) активен
+        # ТОЛЬКО при self.training=True - после model.eval() он
+        # отключается, и MC Dropout инференс теряет основной источник
+        # стохастичности. Разбивая на отдельные блоки, мы делаем
+        # межслойный дропаут управляемым через MonteCarloDropout.
+        self.lstm_layers = nn.ModuleList()
+        self.lstm_dropouts = nn.ModuleList()
+        in_dim = cfg.conv_channels
+        for _ in range(cfg.lstm_layers):
+            self.lstm_layers.append(
+                nn.LSTM(
+                    input_size=in_dim,
+                    hidden_size=cfg.lstm_hidden,
+                    num_layers=1,
+                    batch_first=True,
+                    dropout=0.0,  # отключаем встроенный, ставим явный MC Dropout
+                ),
+            )
+            self.lstm_dropouts.append(MonteCarloDropout(cfg.dropout))
+            in_dim = cfg.lstm_hidden
+        # Финальный dropout перед головой - перенесён сюда (раньше был
+        # отдельный self.lstm_drop).
         self.head = nn.Sequential(
             nn.Linear(cfg.lstm_hidden, cfg.fc_hidden),
             nn.GELU(),
@@ -77,7 +91,10 @@ class ConvLstmRegressor(nn.Module):
         x = self.conv_act(x)
         x = self.conv_drop(x)
         x = x.transpose(1, 2)            # (B, T, C)
-        lstm_out, _ = self.lstm(x)
-        last = lstm_out[:, -1, :]
-        last = self.lstm_drop(last)
+
+        # Прогон через стек LSTM с MC-дропаутами между слоями.
+        for lstm, drop in zip(self.lstm_layers, self.lstm_dropouts):
+            x, _ = lstm(x)
+            x = drop(x)
+        last = x[:, -1, :]
         return self.head(last)

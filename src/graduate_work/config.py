@@ -9,6 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pandas as pd
+
 # config.py is at <project>/src/graduate_work/config.py -> parents[2] = <project>
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -83,6 +85,20 @@ class DataConfig:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     # tail = 1 - train_ratio - val_ratio
+
+    @property
+    def bar_timedelta(self) -> pd.Timedelta:
+        """Length of one bar as a pandas Timedelta."""
+        return pd.Timedelta(minutes=self.bar_minutes)
+
+    @property
+    def bars_per_year(self) -> float:
+        """Bars in a trading year (252 days * bars/session)."""
+        start = pd.Timestamp(self.session_start_utc)
+        end = pd.Timestamp(self.session_end_utc)
+        session_minutes = int((end - start).total_seconds() / 60) + 1
+        bars_per_session = max(1, session_minutes // self.bar_minutes)
+        return float(252 * bars_per_session)
 
 
 @dataclass(frozen=True)

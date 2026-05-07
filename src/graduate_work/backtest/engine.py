@@ -81,6 +81,9 @@ def run_backtest(
 
     lookup = _price_lookup(prices)
     trading_days = pd.DatetimeIndex(sorted(prices.index.unique()))
+    # Map timestamp -> integer position in trading_days. Используется для
+    # строгого "horizon в барах": exit_idx = entry_idx + horizon.
+    bar_index: dict[pd.Timestamp, int] = {ts: i for i, ts in enumerate(trading_days)}
 
     equity = cfg.initial_capital
     cash = equity
@@ -148,15 +151,15 @@ def run_backtest(
                     if qty <= 0:
                         continue
                     cash -= invest
-                    close_date = day + pd.Timedelta(days=int(row["horizon"]))
-                    # Сдвигаем close_date на ближайший торговый день.
-                    future = trading_days[trading_days >= close_date]
-                    if len(future) == 0:
-                        # Прогноз уходит за горизонт теста - ликвидируем
-                        # сегодня (откатываем сделку).
+                    # Horizon выражен в БАРАХ - закрываем позицию через
+                    # row["horizon"] баров от текущего entry-бара.
+                    entry_idx = bar_index.get(day)
+                    horizon_bars = int(row["horizon"])
+                    if entry_idx is None or entry_idx + horizon_bars >= len(trading_days):
+                        # Прогноз уходит за хвост тестового окна - откат.
                         cash += invest
                         continue
-                    close_date = future[0]
+                    close_date = trading_days[entry_idx + horizon_bars]
                     open_positions.append(
                         {
                             "open_date": day,

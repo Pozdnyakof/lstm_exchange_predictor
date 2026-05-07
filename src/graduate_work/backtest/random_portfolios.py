@@ -59,6 +59,7 @@ def _simulate_one(
     cost_close = cfg.commission_rate + cfg.slippage_rate
     cash = cfg.initial_capital
     positions: list[dict] = []
+    bar_index = {ts: i for i, ts in enumerate(calendar)}
 
     for day in calendar:
         # 1) Закрываем созревшие позиции.
@@ -92,17 +93,17 @@ def _simulate_one(
             continue
 
         cash -= budget
-        # Срок удержания случайный в окрестности среднего по стратегии.
+        # Срок удержания в БАРАХ (как у стратегии). Случайный в окрестности
+        # среднего horizon-в-барах.
         h = max(int(rng.integers(max(avg_horizon - 2, 1), max(avg_horizon + 3, 2))), 1)
-        close_date = day + pd.Timedelta(days=h)
-        future = calendar[calendar >= close_date]
-        if len(future) == 0:
+        entry_idx = bar_index.get(day)
+        if entry_idx is None or entry_idx + h >= len(calendar):
             cash += budget
             continue
         positions.append(
             {
                 "open_date": day,
-                "close_date": future[0],
+                "close_date": calendar[entry_idx + h],
                 "ticker": ticker,
                 "entry_price": price,
                 "quantity": qty,

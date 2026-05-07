@@ -98,6 +98,13 @@ def _load_macro(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
 
 
 def _load_indexes(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
+    """Загрузить close-фрейм по всем индексам.
+
+    Возвращает DataFrame с колонками `index_<code>_close` (чистая цена,
+    без производных). Log-return считается ПОЗЖЕ - после выравнивания
+    на сетку признаков тикера, чтобы избежать ffill'а ступенчатого
+    log_return через сотни баров.
+    """
     out = pd.DataFrame()
     idx_dir = paths.data_raw / "indexes"
     if not idx_dir.exists():
@@ -112,12 +119,32 @@ def _load_indexes(paths: Paths, cfg: DataConfig) -> pd.DataFrame:
         df = resample_ohlcv(df, cfg)
         if df.empty:
             continue
-        log_ret = np.log(df["close"].astype(float) / df["close"].astype(float).shift(1))
-        col = f"index_{code.lower()}_logret"
-        log_ret.name = col
-        out = log_ret.to_frame() if out.empty else out.join(log_ret, how="outer")
+        col = f"index_{code.lower()}_close"
+        close = df["close"].astype(float)
+        close.name = col
+        out = close.to_frame() if out.empty else out.join(close, how="outer")
     if not out.empty:
-        out = out.sort_index().fillna(0.0)
+        out = out.sort_index()
+    return out
+
+
+def _index_log_returns(indexes: pd.DataFrame, target_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Перевести close-фрейм индексов в log-return на сетке `target_index`.
+
+    1) reindex(method=ffill) - выровнять цены на бары тикера;
+    2) log_return = log(close[t] / close[t-1]) НА ЭТОЙ сетке;
+       пропуски (между сессиями) трактуются как 0.
+    """
+    if indexes.empty or len(target_index) == 0:
+        return pd.DataFrame(index=target_index)
+    aligned = indexes.reindex(target_index, method="ffill")
+    out = pd.DataFrame(index=target_index)
+    for col in aligned.columns:
+        # close → log-return: ровно один шаг на каждой паре баров.
+        ret = np.log(aligned[col] / aligned[col].shift(1))
+        # переименовываем "..._close" → "..._logret"
+        ret.name = col.replace("_close", "_logret")
+        out[ret.name] = ret.fillna(0.0)
     return out
 
 
@@ -147,8 +174,11 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
             macro_aligned = macro.reindex(feat.index, method="ffill")
             feat = pd.concat([feat, macro_aligned], axis=1)
         if not indexes.empty:
-            idx_aligned = indexes.reindex(feat.index, method="ffill").fillna(0.0)
-            feat = pd.concat([feat, idx_aligned], axis=1)
+            # Сначала выравниваем цены индекса на бары тикера, потом
+            # считаем log_return - чтобы избежать ffill ступенчатой
+            # автокорреляции в фиче.
+            idx_logret = _index_log_returns(indexes, feat.index)
+            feat = pd.concat([feat, idx_logret], axis=1)
 
         targets = normalized_log_returns(feat["close"], cfg.horizons)
         feat = pd.concat([feat, targets], axis=1)
@@ -171,12 +201,41 @@ def build_feature_frame(cfg: DataConfig, paths: Paths) -> tuple[pd.DataFrame, li
 # Хронологическое разделение и нарезка окон
 # ----------------------------------------------------------------------
 
+def _purge_tail(df: pd.DataFrame, drop_last: int) -> pd.DataFrame:
+    """Удалить последние ``drop_last`` баров каждого тикера.
+
+    Нужно для train и val, потому что target_h в этих хвостах
+    подсматривает в первые ``drop_last`` баров СЛЕДУЮЩЕГО split'а.
+    Без этого получается оптимистичная утечка на границе.
+    """
+    if drop_last <= 0 or df.empty or "ticker" not in df.columns:
+        return df
+    # Позиционная маска: для каждого тикера дропаем последние drop_last
+    # позиций. Работает корректно при дубликатах в DatetimeIndex.
+    ticker_arr = df["ticker"].to_numpy()
+    keep = np.ones(len(df), dtype=bool)
+    for ticker in pd.unique(ticker_arr):
+        positions = np.where(ticker_arr == ticker)[0]
+        if len(positions) > drop_last:
+            keep[positions[-drop_last:]] = False
+        else:
+            keep[positions] = False
+    return df.iloc[keep].copy()
+
+
 def chronological_split(
     df: pd.DataFrame,
     train_ratio: float,
     val_ratio: float,
+    *,
+    purge_horizon: int = 0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Разделить таблицу по уникальным датам индекса (без перемешивания)."""
+    """Разделить таблицу по уникальным датам индекса (без перемешивания).
+
+    ``purge_horizon`` - количество последних баров каждого тикера в train
+    и val, которые отбрасываются, потому что их target подсматривает в
+    следующий split. Передавайте ``max(horizons)``.
+    """
     unique_dates = np.array(sorted(df.index.unique()))
     n = len(unique_dates)
     if n < 3:
@@ -187,10 +246,13 @@ def chronological_split(
     train_dates = unique_dates[:train_end]
     val_dates = unique_dates[train_end:val_end]
     test_dates = unique_dates[val_end:]
+    train_df = df.loc[df.index.isin(train_dates)].copy()
+    val_df = df.loc[df.index.isin(val_dates)].copy()
+    test_df = df.loc[df.index.isin(test_dates)].copy()
     return (
-        df.loc[df.index.isin(train_dates)].copy(),
-        df.loc[df.index.isin(val_dates)].copy(),
-        df.loc[df.index.isin(test_dates)].copy(),
+        _purge_tail(train_df, purge_horizon),
+        _purge_tail(val_df, purge_horizon),
+        test_df,
     )
 
 
@@ -243,8 +305,11 @@ def build_dataset(
     full, feature_cols = build_feature_frame(cfg, paths)
     full = full.dropna(subset=feature_cols)  # отбросить строки с NaN признаками
 
+    # Purge: target_h на хвосте train/val подсматривает в следующий
+    # split. Дропаем последние max(horizons) баров каждого тикера.
     train_df, val_df, test_df = chronological_split(
         full, cfg.train_ratio, cfg.val_ratio,
+        purge_horizon=max(cfg.horizons),
     )
 
     scaler = StandardScaler()

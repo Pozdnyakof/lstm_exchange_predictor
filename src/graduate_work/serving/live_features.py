@@ -21,6 +21,7 @@ import pandas as pd
 from ..config import DataConfig, ServingConfig
 from ..data import moex_iss
 from ..data.resample import resample_ohlcv
+from ..features.advanced import add_advanced_indicators
 from ..features.technical import add_technical_indicators
 from ..features.windows import make_sliding_windows
 from .model_loader import LoadedModel
@@ -123,11 +124,18 @@ class LiveFeatureBuilder:
         feat = add_technical_indicators(
             raw.drop(columns=[c for c in ["ticker"] if c in raw.columns]),
         )
-        # Колонки макро/индексов в live-режиме недоступны: заполняем 0
-        # (после стандартизации это «средний наблюдённый уровень»).
+        # Тот же конвейер advanced-индикаторов, что использовался при
+        # обучении (MACD/Bollinger/Stoch/Williams/CCI/ROC/OBV/MFI/Hurst
+        # + temporal). Без этого live получал ~25 фич, заполненных нулями.
+        feat = add_advanced_indicators(feat, market="moex")
+
+        # Колонки макро/индексов в live-режиме недоступны - заполняем
+        # средним train-распределения (через scaler.mean_), чтобы после
+        # стандартизации получить ровно 0 (= "средний наблюдённый уровень").
         for col in meta.feature_cols:
             if col not in feat.columns:
-                feat[col] = 0.0
+                feat[col] = self.loaded.scaler.mean_.get(col, 0.0)
+
         feat = feat[meta.feature_cols].copy()
         feat = self.loaded.scaler.transform(feat).dropna()
         # В live таргет неизвестен - подставляем нули, чтобы

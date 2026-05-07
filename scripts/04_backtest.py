@@ -92,18 +92,25 @@ def main() -> None:
         full = full.set_index("timestamp")
     full.index = pd.to_datetime(full.index, utc=True)
     test_start = pd.to_datetime(min(test["timestamp"]), utc=True)
-    test_end = pd.to_datetime(max(test["timestamp"]), utc=True) + pd.Timedelta(days=max(horizons))
+    # Буфер: max(horizons) баров после последнего test-времени, чтобы
+    # хвостовые позиции могли закрыться.
+    buffer = cfg.data.bar_timedelta * max(horizons)
+    test_end = pd.to_datetime(max(test["timestamp"]), utc=True) + buffer
     test_prices = prices_from_full_frame(
         full.loc[(full.index >= test_start) & (full.index <= test_end)],
     )
 
     # 6) Aggregate бэктест.
     bt = run_backtest(signals, test_prices, cfg.trading)
-    metrics = compute_metrics(bt.equity, bt.trades)
+    bars_per_year = cfg.data.bars_per_year
+    metrics = compute_metrics(bt.equity, bt.trades, periods_per_year=bars_per_year)
     logging.info("Aggregate metrics: %s", metrics)
 
     # 7) Per-ticker бэктест.
-    per_ticker = run_per_ticker_backtest(signals, test_prices, cfg.trading)
+    per_ticker = run_per_ticker_backtest(
+        signals, test_prices, cfg.trading,
+        periods_per_year=bars_per_year,
+    )
     logging.info(
         "Per-ticker: %d рядов, профит-тикеров %d/%d",
         len(per_ticker),
@@ -116,10 +123,23 @@ def main() -> None:
         int(round(bt.trades["horizon"].mean()))
         if not bt.trades.empty else int(np.mean(horizons))
     )
+    # H2 фикс: trade_probability вычисляется из реальной частоты сигналов
+    # стратегии, чтобы random monkeys имели сопоставимый turnover.
+    n_buy = int((signals["action"] == "BUY").sum())
+    n_bars = int(len(test_prices.index.unique()))
+    trade_prob = (
+        max(min(n_buy / max(n_bars * cfg.trading.max_positions, 1), 1.0), 1e-4)
+        if n_buy > 0 else 0.05
+    )
+    logging.info(
+        "Random monkeys: avg_horizon=%d bars, trade_probability=%.4f (BUY=%d, bars=%d)",
+        avg_h, trade_prob, n_buy, n_bars,
+    )
     random_report = run_random_portfolios(
         test_prices,
         cfg.trading,
         avg_horizon=avg_h,
+        trade_probability=trade_prob,
         strategy_final=metrics["final_equity"],
         seed=cfg.training.seed,
     )
