@@ -131,6 +131,78 @@ def test_conformal_uncalibrated_uses_fallback() -> None:
     assert set(buys["ticker"]) == {"B"}
 
 
+def test_conformal_directional_uses_only_positives() -> None:
+    """В directional режиме calibrate использует только actual>=0.5 примеры."""
+    rng = np.random.default_rng(0)
+    n = 200
+    timestamps = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
+    actual_vals = np.array([1.0] * 100 + [0.0] * 100)
+    # У позитивных prob ~ Uniform(0.4, 0.6), у негативных ~ Uniform(0.1, 0.3).
+    probs = np.where(
+        actual_vals == 1.0,
+        rng.uniform(0.4, 0.6, n),
+        rng.uniform(0.1, 0.3, n),
+    )
+    val_pred = build_predictions_frame(
+        timestamps=np.array(timestamps),
+        tickers=np.array(["A"] * n),
+        mean=probs.reshape(-1, 1).astype(np.float32),
+        std=np.full((n, 1), 0.05, dtype=np.float32),
+        horizons=(1,),
+    )
+    val_targets = val_pred[["timestamp", "ticker", "horizon"]].copy()
+    val_targets["actual"] = actual_vals
+
+    cfg = TradingConfig()
+    gen = ConformalSignalGenerator(cfg, alpha=0.1, directional=True)
+    res = gen.calibrate(val_pred, val_targets)
+    # Скоры считаются только на 100 позитивах; 1-prob ∈ [0.4, 0.6].
+    assert res.n_val_scores == 100
+    # 0.9-квантиль score ≈ 0.58 ⇒ threshold = 1-q ≈ 0.42.
+    assert 0.35 <= res.threshold <= 0.50
+    # threshold должен ослабиться по сравнению с two-sided (где threshold ≈ 0.7).
+    assert res.threshold < 0.55
+
+
+def test_conformal_directional_falls_back_when_no_positives() -> None:
+    rng = np.random.default_rng(0)
+    n = 50
+    timestamps = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
+    val_pred = build_predictions_frame(
+        timestamps=np.array(timestamps),
+        tickers=np.array(["A"] * n),
+        mean=rng.uniform(0.1, 0.4, (n, 1)).astype(np.float32),
+        std=np.full((n, 1), 0.05, dtype=np.float32),
+        horizons=(1,),
+    )
+    val_targets = val_pred[["timestamp", "ticker", "horizon"]].copy()
+    val_targets["actual"] = 0.0  # все негативные
+
+    cfg = TradingConfig()
+    gen = ConformalSignalGenerator(cfg, alpha=0.1, directional=True)
+    res = gen.calibrate(val_pred, val_targets)
+    assert res.threshold == 0.5
+    assert res.n_val_scores == 0
+
+
+def test_conformal_directional_generate_uses_one_minus_q() -> None:
+    """generate() с directional=True использует threshold = 1-q."""
+    cfg = TradingConfig(max_positions=4)
+    gen = ConformalSignalGenerator(cfg, alpha=0.1, directional=True)
+    gen._quantile = 0.6  # ⇒ threshold = 0.4.
+
+    timestamps = np.array(["2024-01-01"] * 4, dtype="datetime64[ns]")
+    tickers = np.array(["A", "B", "C", "D"])
+    mean = np.array([[0.30], [0.39], [0.45], [0.50]], dtype=np.float32)
+    std = np.full((4, 1), 0.05, dtype=np.float32)
+    df = build_predictions_frame(timestamps, tickers, mean, std, horizons=(1,))
+
+    sigs = gen.generate(df)
+    buys = sigs[sigs["action"] == "BUY"]
+    # threshold = 1 - 0.6 = 0.4; пройдут C (0.45) и D (0.50).
+    assert set(buys["ticker"]) == {"C", "D"}
+
+
 def test_conformal_picks_best_horizon_per_ticker() -> None:
     """Если несколько горизонтов — берём argmax по prob."""
     cfg = TradingConfig(max_positions=1)

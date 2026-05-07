@@ -74,12 +74,14 @@ class ConformalSignalGenerator:
         cfg: TradingConfig,
         *,
         alpha: float = 0.1,
+        directional: bool = False,
     ) -> None:
         if not 0.0 < alpha < 1.0:
             msg = f"alpha must be in (0, 1), got {alpha}"
             raise ValueError(msg)
         self.cfg = cfg
         self.alpha = float(alpha)
+        self.directional = bool(directional)
         self._quantile: float | None = None
 
     @property
@@ -105,10 +107,20 @@ class ConformalSignalGenerator:
             self._quantile = _FALLBACK_QUANTILE
             return ConformalCalibration(_FALLBACK_QUANTILE, _FALLBACK_QUANTILE, 0)
 
-        scores = np.abs(
-            merged["mean"].to_numpy(dtype=np.float64)
-            - merged["actual"].to_numpy(dtype=np.float64),
-        )
+        if self.directional:
+            # Directional mode: фокусируемся на UP-классе, score = 1 - prob.
+            # Полезно при class imbalance — порог получается = "минимальная
+            # вероятность, при которой 1-α позитивных примеров проходит фильтр".
+            positives = merged[merged["actual"] >= 0.5]
+            if positives.empty:
+                self._quantile = _FALLBACK_QUANTILE
+                return ConformalCalibration(_FALLBACK_QUANTILE, _FALLBACK_QUANTILE, 0)
+            scores = 1.0 - positives["mean"].to_numpy(dtype=np.float64)
+        else:
+            scores = np.abs(
+                merged["mean"].to_numpy(dtype=np.float64)
+                - merged["actual"].to_numpy(dtype=np.float64),
+            )
         scores = scores[np.isfinite(scores)]
         if scores.size == 0:
             self._quantile = _FALLBACK_QUANTILE
@@ -118,9 +130,13 @@ class ConformalSignalGenerator:
         level = min(1.0, (1.0 - self.alpha) * (1 + 1 / max(n, 1)))
         q = float(np.quantile(scores, level))
         self._quantile = q
-        threshold = max(q, 1.0 - q)
+        if self.directional:
+            threshold = float(np.clip(1.0 - q, 0.0, 1.0))
+        else:
+            threshold = max(q, 1.0 - q)
         logger.info(
-            "Conformal: alpha=%.3f, n=%d, level=%.4f, q=%.4f, threshold=%.4f",
+            "Conformal[%s]: alpha=%.3f, n=%d, level=%.4f, q=%.4f, threshold=%.4f",
+            "directional" if self.directional else "two-sided",
             self.alpha, n, level, q, threshold,
         )
         return ConformalCalibration(q, threshold, n)
@@ -143,7 +159,10 @@ class ConformalSignalGenerator:
         best = predictions.loc[idx].reset_index(drop=True)
 
         q = self._quantile if self._quantile is not None else _FALLBACK_QUANTILE
-        threshold = max(q, 1.0 - q)
+        if self.directional:
+            threshold = float(np.clip(1.0 - q, 0.0, 1.0))
+        else:
+            threshold = max(q, 1.0 - q)
 
         sessions: list[pd.DataFrame] = []
         for _ts, day in best.groupby("timestamp", sort=True):
