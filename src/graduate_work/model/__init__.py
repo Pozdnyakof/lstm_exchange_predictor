@@ -6,7 +6,7 @@ from torch import nn
 
 from ..config import ModelConfig
 from .conv_lstm import ConvLstmRegressor
-from .linear_baselines import DLinear, NLinear
+from .linear_baselines import VLinear, XLinear
 from .mc_dropout import MonteCarloDropout, set_mc_dropout
 from .revin import RevIN
 from .timexer import TimeXer
@@ -22,8 +22,8 @@ def build_model(
     Поддерживаемые значения:
         - ``"timexer"``    — Transformer-baseline (R-0023 / R09.M).
         - ``"conv_lstm"``  — гибридная 1D-CNN + LSTM (исходник §2.2).
-        - ``"dlinear"``    — Decomposition-Linear (Zeng et al. 2023).
-        - ``"nlinear"``    — Normalisation-Linear (Zeng et al. 2023).
+        - ``"vlinear"``    — vanilla Linear (Zeng et al. 2023).
+        - ``"xlinear"``    — XLinear с поддержкой exo (arXiv:2601.09237, AAAI 2026).
         - ``"moment"``     — MOMENT-1 frozen encoder + trainable head.
                             Требует ``pip install momentfm``.
     """
@@ -34,10 +34,10 @@ def build_model(
         return ConvLstmRegressor(
             input_dim=input_dim, num_horizons=num_horizons, cfg=cfg,
         )
-    if arch == "dlinear":
-        return DLinear(input_dim=input_dim, num_horizons=num_horizons, cfg=cfg)
-    if arch == "nlinear":
-        return NLinear(input_dim=input_dim, num_horizons=num_horizons, cfg=cfg)
+    if arch == "vlinear":
+        return VLinear(input_dim=input_dim, num_horizons=num_horizons, cfg=cfg)
+    if arch == "xlinear":
+        return XLinear(input_dim=input_dim, num_horizons=num_horizons, cfg=cfg)
     if arch == "moment":
         # Лениво: импорт только при запросе, чтобы отсутствие momentfm
         # не валило весь пакет.
@@ -47,18 +47,18 @@ def build_model(
         )
     msg = (
         f"Неизвестная архитектура: {arch!r} "
-        "(ожидается 'timexer' | 'conv_lstm' | 'dlinear' | 'nlinear' | 'moment')"
+        "(ожидается 'timexer' | 'conv_lstm' | 'vlinear' | 'xlinear' | 'moment')"
     )
     raise ValueError(msg)
 
 
 __all__ = [
     "ConvLstmRegressor",
-    "DLinear",
     "MonteCarloDropout",
-    "NLinear",
     "RevIN",
     "TimeXer",
+    "VLinear",
+    "XLinear",
     "build_model",
     "set_mc_dropout",
 ]
