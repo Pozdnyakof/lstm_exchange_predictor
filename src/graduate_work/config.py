@@ -70,17 +70,14 @@ class DataConfig:
     extra_indexes: tuple[str, ...] = ("RGBI", "RTSI")
     brent_symbol: str = "BZ=F"  # Yahoo Finance тикер Brent
     cbr_currencies: tuple[str, ...] = ("USD", "EUR")
-    # MOEX currency/selt инструменты с интрадей историей с 2020 г.
-    # Прямые драйверы выручки commodity-экспортёров (PLZL ↔ GLDRUB,
-    # GMKN ↔ драгметаллы × USDRUB). Для PLZL log_return GLDRUB_TOM
-    # коррелирует ~0.7-0.9 на дневной частоте.
-    # MOEX не отдаёт 5-мин candles на этом endpoint — используем 10 мин,
-    # потом ffill на 5-мин сетку тикера.
-    metals_fx_codes: tuple[str, ...] = (
-        "GLDRUB_TOM",     # золото-RUB спот
-        "SLVRUB_TOM",     # серебро-RUB спот
-        "USD000UTSTOM",   # USDRUB спот (TOM)
-    )
+    # MOEX currency/selt инструменты с интрадей историей.
+    # Эксперимент с PLZL/GMKN: добавление GLDRUB_TOM/SLVRUB_TOM/USD000UTSTOM
+    # как фичей edge не дало (USDRUB пустой post-2024-06 из-за санкций;
+    # gold/silver intraday — слишком разреженный объём, чтобы давать
+    # сигнал). Поэтому по умолчанию отключено. Чтобы включить, передайте
+    # codes в DataConfig: metals_fx_codes=("GLDRUB_TOM", "SLVRUB_TOM").
+    # Полный список рабочих инструментов задокументирован в data/orchestrator.py.
+    metals_fx_codes: tuple[str, ...] = ()
     metals_fx_interval: int = 10
     # Горизонты прогноза в барах (5-минутных):
     # 6=30мин, 12=1ч, 24=2ч, 48=4ч.
