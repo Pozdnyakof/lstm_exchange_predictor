@@ -79,6 +79,10 @@ def _simulate_one(
         if rng.random() >= trade_probability:
             continue
         ticker = tickers[int(rng.integers(0, len(tickers)))]
+        # Per-ticker uniqueness (как в engine): не дублируем тикер.
+        held = {str(p["ticker"]) for p in positions}
+        if ticker in held:
+            continue
         price = lookup.get((day, ticker))
         if price is None or price <= 0:
             continue

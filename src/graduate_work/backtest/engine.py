@@ -134,9 +134,13 @@ def run_backtest(
         # 2) Открываем новые позиции по сигналам сегодняшней даты.
         day_signals = grouped.get(day)
         if day_signals is not None and not day_signals.empty:
+            # Per-ticker uniqueness: не открываем второй вход на тот же
+            # тикер, если по нему уже есть открытая позиция.
+            held_tickers = {str(p["ticker"]) for p in open_positions}
             free_slots = cfg.max_positions - len(open_positions)
             if free_slots > 0:
-                top = day_signals.sort_values("mean", ascending=False).head(free_slots)
+                fresh_signals = day_signals[~day_signals["ticker"].astype(str).isin(held_tickers)]
+                top = fresh_signals.sort_values("mean", ascending=False).head(free_slots)
                 # Капитал делим равномерно между новыми входами.
                 budget = cash / max(free_slots, 1)
                 for _, row in top.iterrows():

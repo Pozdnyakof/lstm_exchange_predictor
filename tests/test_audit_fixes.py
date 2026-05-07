@@ -139,3 +139,62 @@ def test_purge_tail_no_op_when_drop_last_zero() -> None:
     idx = pd.date_range("2024-01-02 07:00", periods=10, freq="5min", tz="UTC")
     df = pd.DataFrame({"close": np.arange(10.0), "ticker": "X"}, index=idx)
     assert len(_purge_tail(df, drop_last=0)) == 10
+
+
+# ---------------------------------------------------------------------------
+# Per-ticker uniqueness в engine (один тикер - одна одновременная позиция)
+# ---------------------------------------------------------------------------
+
+def test_engine_does_not_open_second_position_on_same_ticker() -> None:
+    """Если по тикеру уже есть открытая позиция, повторный BUY-сигнал
+    не должен порождать вторую параллельную позицию."""
+    n = 30
+    idx = pd.date_range("2024-01-02 07:00", periods=n, freq="5min", tz="UTC")
+    prices = pd.DataFrame(
+        {"close": np.linspace(100.0, 105.0, n), "ticker": "TST"},
+        index=idx,
+    )
+    cfg = TradingConfig(
+        initial_capital=100_000.0, max_positions=3,
+        commission_rate=0.0, slippage_rate=0.0,
+    )
+    # BUY на баре 0 (horizon=10 -> закрытие на баре 10) и BUY на баре 5
+    # (тикер уже занят) - второй должен быть пропущен.
+    signals = pd.DataFrame(
+        [
+            {"timestamp": idx[0], "ticker": "TST",
+             "horizon": 10, "mean": 0.01, "std": 0.001, "action": "BUY"},
+            {"timestamp": idx[5], "ticker": "TST",
+             "horizon": 10, "mean": 0.02, "std": 0.001, "action": "BUY"},
+        ],
+    )
+    bt = run_backtest(signals, prices, cfg)
+    # Должна получиться ровно одна сделка (вторая залимитировала uniqueness).
+    assert len(bt.trades) == 1
+    assert bt.trades.iloc[0]["open_date"] == idx[0]
+
+
+def test_engine_holds_multiple_tickers_in_parallel() -> None:
+    """Разные тикеры в один день должны открываться параллельно
+    (до max_positions)."""
+    n = 30
+    idx = pd.date_range("2024-01-02 07:00", periods=n, freq="5min", tz="UTC")
+    prices = pd.concat([
+        pd.DataFrame({"close": np.linspace(100.0, 110.0, n), "ticker": "A"}, index=idx),
+        pd.DataFrame({"close": np.linspace(50.0, 55.0, n), "ticker": "B"}, index=idx),
+    ])
+    cfg = TradingConfig(
+        initial_capital=100_000.0, max_positions=2,
+        commission_rate=0.0, slippage_rate=0.0,
+    )
+    signals = pd.DataFrame(
+        [
+            {"timestamp": idx[0], "ticker": "A",
+             "horizon": 5, "mean": 0.01, "std": 0.001, "action": "BUY"},
+            {"timestamp": idx[0], "ticker": "B",
+             "horizon": 5, "mean": 0.012, "std": 0.001, "action": "BUY"},
+        ],
+    )
+    bt = run_backtest(signals, prices, cfg)
+    assert len(bt.trades) == 2
+    assert set(bt.trades["ticker"]) == {"A", "B"}

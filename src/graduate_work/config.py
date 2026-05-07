@@ -33,44 +33,13 @@ class Paths:
 class DataConfig:
     """Параметры сбора и подготовки данных (модули 1-2)."""
 
-    # Топ-5 самых волатильных тикеров MOEX по annualized daily vol
-    # за 2020-2025: MTLR=67%, SMLT=64%, VTBR=52%, AFLT=50%, GAZP=47%.
-    # Концентрация на высокой волатильности улучшает SNR для нейросети
-    # и ускоряет обучение. CSV всех 30 тикеров остаются на диске и Drive,
-    # для перерасчёта/расширения список можно вернуть к полному (см. ниже).
+    # 12 тикеров, отобранные по результатам предыдущего per-ticker бэктеста
+    # (ранжирование по комбинации Sharpe / total_return / win_rate).
+    # CSV всех 30 тикеров остаются на диске и Drive — для перерасчёта
+    # достаточно поменять этот кортеж.
     tickers: tuple[str, ...] = (
-        # Голубые фишки IMOEX
-        "SBER",
-        "GAZP",
-        "LKOH",
-        "GMKN",
-        "ROSN",
-        "NVTK",
-        "MTSS",
-        "MGNT",
-        "PLZL",
-        "TATN",
-        "CHMF",
-        "ALRS",
-        "SNGS",
-        "YDEX",
-        # Расширение - ликвидные бумаги с историей с 2022-09
-        "VTBR",
-        "MOEX",
-        "PIKK",
-        "PHOR",
-        "AFKS",
-        "HYDR",
-        "IRAO",
-        "RUAL",
-        "NLMK",
-        "MAGN",
-        "AFLT",
-        "SIBN",
-        "RTKM",
-        "MTLR",
-        "FLOT",
-        "SMLT",
+        "GMKN", "RUAL", "SIBN", "NLMK", "PLZL", "NVTK",
+        "FLOT", "GAZP", "MTSS", "MGNT", "SNGS", "PHOR",
     )
     start_date: str = "2020-01-01"
     end_date: str = "2026-01-01"
