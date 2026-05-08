@@ -79,6 +79,17 @@ class DataConfig:
     # Полный список рабочих инструментов задокументирован в data/orchestrator.py.
     metals_fx_codes: tuple[str, ...] = ()
     metals_fx_interval: int = 10
+    # === ALGOPACK (платный premium-фид MOEX) ===
+    # Микроструктурные данные: aggressive buy/sell разбивка volume,
+    # order-flow из заявок (выставленные/снятые), order-book imbalance
+    # и spreads. Все 5-мин с 2020-01. Order flow imbalance — один из
+    # сильнейших интрадей-предикторов направления в литературе.
+    # Включается передачей algopack_products + переменной окружения
+    # ALGOPACK_TOKEN. По умолчанию выключено — пайплайн работает и без
+    # подписки. Допустимые значения: 'tradestats' | 'orderstats' | 'obstats'.
+    algopack_products: tuple[str, ...] = ()
+    algopack_market: str = "eq"  # eq | fo | fx
+    algopack_request_pause_sec: float = 0.12
     # Горизонты прогноза в барах (5-минутных):
     # 6=30мин, 12=1ч, 24=2ч, 48=4ч.
     # Длинные горизонты компенсируют комиссии/проскальзывание (round-trip
