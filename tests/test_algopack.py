@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import numpy as np
 import pandas as pd
 import pytest
 
@@ -94,8 +93,8 @@ def _make_client_with_pages(pages: list[list[list]], columns: list[str]) -> Algo
 def test_paginate_concatenates_pages_until_short() -> None:
     cols = ["tradedate", "tradetime", "vol"]
     pages = [
-        [[f"2024-01-{i:02d}", "10:00:00", i] for i in range(1, 11)],  # 10 rows
-        [[f"2024-01-{i:02d}", "10:00:00", i] for i in range(11, 14)], # 3 rows < page_size
+        [[f"2024-01-{i:02d}", "10:00:00", i] for i in range(1, 11)],   # 10 rows
+        [[f"2024-01-{i:02d}", "10:00:00", i] for i in range(11, 14)],  # 3 rows < page_size
     ]
     client = _make_client_with_pages(pages, cols)
     df = client._paginate("path", {}, page_size=10)
@@ -149,16 +148,16 @@ def _fake_supercandle_frame(rows: int = 5) -> pd.DataFrame:
 
 def test_tradestats_features_imbalance_calc() -> None:
     df = _fake_supercandle_frame(2)
-    df["vol"]      = [100.0, 200.0]
-    df["vol_b"]    = [70.0,  150.0]
-    df["vol_s"]    = [30.0,  50.0]
-    df["val"]      = [10000.0, 20000.0]
-    df["val_b"]    = [7000.0,  15000.0]
-    df["val_s"]    = [3000.0,  5000.0]
-    df["trades"]   = [10, 20]
+    df["vol"] = [100.0, 200.0]
+    df["vol_b"] = [70.0, 150.0]
+    df["vol_s"] = [30.0, 50.0]
+    df["val"] = [10000.0, 20000.0]
+    df["val_b"] = [7000.0, 15000.0]
+    df["val_s"] = [3000.0, 5000.0]
+    df["trades"] = [10, 20]
     df["trades_b"] = [7, 14]
     df["trades_s"] = [3, 6]
-    df["disb"]     = [0.4, 0.5]
+    df["disb"] = [0.4, 0.5]
     out = tradestats_features(df)
     assert out["aps_vol_imb"].iloc[0] == pytest.approx(0.40)
     assert out["aps_val_imb"].iloc[0] == pytest.approx(0.40)
@@ -168,9 +167,15 @@ def test_tradestats_features_imbalance_calc() -> None:
 
 def test_tradestats_features_handles_zero_volume() -> None:
     df = _fake_supercandle_frame(1)
-    df["vol"] = [0.0]; df["vol_b"] = [0.0]; df["vol_s"] = [0.0]
-    df["val"] = [0.0]; df["val_b"] = [0.0]; df["val_s"] = [0.0]
-    df["trades"] = [0]; df["trades_b"] = [0]; df["trades_s"] = [0]
+    df["vol"] = [0.0]
+    df["vol_b"] = [0.0]
+    df["vol_s"] = [0.0]
+    df["val"] = [0.0]
+    df["val_b"] = [0.0]
+    df["val_s"] = [0.0]
+    df["trades"] = [0]
+    df["trades_b"] = [0]
+    df["trades_s"] = [0]
     out = tradestats_features(df)
     # Деление 0/0 → 0, не NaN.
     assert out["aps_vol_imb"].iloc[0] == 0.0
@@ -183,21 +188,21 @@ def test_tradestats_features_handles_zero_volume() -> None:
 
 def test_orderstats_features_cancel_ratio() -> None:
     df = _fake_supercandle_frame(2)
-    df["put_orders"]    = [100.0, 50.0]
-    df["put_orders_b"]  = [60.0, 30.0]
-    df["put_orders_s"]  = [40.0, 20.0]
-    df["put_vol"]       = [10000.0, 5000.0]
-    df["put_vol_b"]     = [6000.0, 3000.0]
-    df["put_vol_s"]     = [4000.0, 2000.0]
+    df["put_orders"] = [100.0, 50.0]
+    df["put_orders_b"] = [60.0, 30.0]
+    df["put_orders_s"] = [40.0, 20.0]
+    df["put_vol"] = [10000.0, 5000.0]
+    df["put_vol_b"] = [6000.0, 3000.0]
+    df["put_vol_s"] = [4000.0, 2000.0]
     df["cancel_orders"] = [50.0, 50.0]
     df["cancel_orders_b"] = [30.0, 25.0]
     df["cancel_orders_s"] = [20.0, 25.0]
     out = orderstats_features(df)
     # cancel / (put + cancel) = 50 / 150 = 0.333
-    assert out["aps_cancel_ratio"].iloc[0] == pytest.approx(1/3, abs=1e-3)
+    assert out["aps_cancel_ratio_orders"].iloc[0] == pytest.approx(1/3, abs=1e-3)
     # put orders imbalance (60-40)/100 = 0.2
     assert out["aps_put_orders_imb"].iloc[0] == pytest.approx(0.2)
-    assert "aps_cancel_imb" in out.columns
+    assert "aps_cancel_orders_imb" in out.columns
 
 
 # ---------------------------------------------------------------------------
@@ -211,8 +216,10 @@ def test_obstats_features_uses_mid_for_spread_bp() -> None:
     df["mid_price"] = [100.0]
     df["imbalance_vol_bbo"] = [0.3]
     df["imbalance_val_bbo"] = [0.4]
-    df["levels_b"] = [10]; df["levels_s"] = [5]
-    df["vwap_b_1mio"] = [100.10]; df["vwap_s_1mio"] = [99.90]
+    df["levels_b"] = [10]
+    df["levels_s"] = [5]
+    df["vwap_b_1mio"] = [100.10]
+    df["vwap_s_1mio"] = [99.90]
     out = obstats_features(df)
     # 0.10 / 100 * 1e4 = 10 bp.
     assert out["aps_spread_bbo_bp"].iloc[0] == pytest.approx(10.0)
@@ -228,19 +235,30 @@ def test_obstats_features_uses_mid_for_spread_bp() -> None:
 
 def test_build_algopack_features_merges_all_three() -> None:
     ts = _fake_supercandle_frame(3)
-    ts["vol"] = [100, 100, 100]; ts["vol_b"] = [60, 50, 40]; ts["vol_s"] = [40, 50, 60]
-    ts["val"] = [1000, 1000, 1000]; ts["val_b"] = [600, 500, 400]; ts["val_s"] = [400, 500, 600]
-    ts["trades"] = [10, 10, 10]; ts["trades_b"] = [5, 5, 5]; ts["trades_s"] = [5, 5, 5]
+    ts["vol"] = [100, 100, 100]
+    ts["vol_b"] = [60, 50, 40]
+    ts["vol_s"] = [40, 50, 60]
+    ts["val"] = [1000, 1000, 1000]
+    ts["val_b"] = [600, 500, 400]
+    ts["val_s"] = [400, 500, 600]
+    ts["trades"] = [10, 10, 10]
+    ts["trades_b"] = [5, 5, 5]
+    ts["trades_s"] = [5, 5, 5]
     ts["disb"] = [0.1, 0.0, -0.1]
     ts["pr_vwap"] = [100.0, 101.0, 99.0]
     ts["pr_vwap_b"] = [100.05, 101.02, 99.0]
     ts["pr_vwap_s"] = [99.95, 100.98, 99.0]
 
     os_ = _fake_supercandle_frame(3)
-    os_["put_orders"] = [50, 60, 40]; os_["put_orders_b"] = [25, 30, 20]; os_["put_orders_s"] = [25, 30, 20]
-    os_["put_vol"] = [5000, 6000, 4000]; os_["put_vol_b"] = [2500, 3000, 2000]; os_["put_vol_s"] = [2500, 3000, 2000]
+    os_["put_orders"] = [50, 60, 40]
+    os_["put_orders_b"] = [25, 30, 20]
+    os_["put_orders_s"] = [25, 30, 20]
+    os_["put_vol"] = [5000, 6000, 4000]
+    os_["put_vol_b"] = [2500, 3000, 2000]
+    os_["put_vol_s"] = [2500, 3000, 2000]
     os_["cancel_orders"] = [10, 10, 10]
-    os_["cancel_orders_b"] = [5, 5, 5]; os_["cancel_orders_s"] = [5, 5, 5]
+    os_["cancel_orders_b"] = [5, 5, 5]
+    os_["cancel_orders_s"] = [5, 5, 5]
 
     ob = _fake_supercandle_frame(3)
     ob["mid_price"] = [100.0, 101.0, 99.0]
@@ -248,7 +266,7 @@ def test_build_algopack_features_merges_all_three() -> None:
     ob["imbalance_vol_bbo"] = [0.1, -0.1, 0.0]
 
     out = build_algopack_features(tradestats=ts, orderstats=os_, obstats=ob)
-    assert {"aps_vol_imb", "aps_cancel_ratio", "aps_imb_vol_bbo",
+    assert {"aps_vol_imb", "aps_cancel_ratio_orders", "aps_imb_vol_bbo",
             "aps_order_to_trade"} <= set(out.columns)
     assert len(out) == 3
 
