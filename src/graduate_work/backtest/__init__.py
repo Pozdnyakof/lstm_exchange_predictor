@@ -1,5 +1,6 @@
 """Модуль 4: ретроспективное тестирование."""
 
+from .consensus_engine import run_consensus_backtest
 from .engine import BacktestResult, run_backtest
 from .metrics import compute_metrics
 from .per_ticker import run_per_ticker_backtest
@@ -10,6 +11,7 @@ __all__ = [
     "RandomPortfolioReport",
     "compute_metrics",
     "run_backtest",
+    "run_consensus_backtest",
     "run_per_ticker_backtest",
     "run_random_portfolios",
 ]
