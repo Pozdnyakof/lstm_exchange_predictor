@@ -39,7 +39,6 @@ class DataConfig:
     # достаточно поменять этот кортеж.
     tickers: tuple[str, ...] = (
         "GMKN",
-        "PLZL",
     )
     start_date: str = "2020-01-01"
     end_date: str = "2026-01-01"
