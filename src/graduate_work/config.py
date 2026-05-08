@@ -38,7 +38,8 @@ class DataConfig:
     # CSV всех 30 тикеров остаются на диске и Drive — для перерасчёта
     # достаточно поменять этот кортеж.
     tickers: tuple[str, ...] = (
-        "GMKN",
+        "VTBR",
+        "SBER",
     )
     start_date: str = "2020-01-01"
     end_date: str = "2026-01-01"
@@ -152,8 +153,8 @@ class ModelConfig:
     # === DLinear / NLinear параметры (architecture="dlinear" | "nlinear") ===
     # DLinear / NLinear (Zeng et al., AAAI 2023) — простые baseline'ы,
     # часто превосходят трансформеры на коротких многомерных рядах.
-    linear_seq_len: int = 384            # выровнено с window_size
-    linear_kernel_size: int = 25         # для DLinear: окно скользящего среднего
+    linear_seq_len: int = 384  # выровнено с window_size
+    linear_kernel_size: int = 25  # для DLinear: окно скользящего среднего
 
     # === MOMENT (architecture="moment") ===
     # Foundation model AutonLab/MOMENT-1 (ICML 2024). Encoder заморожен,
