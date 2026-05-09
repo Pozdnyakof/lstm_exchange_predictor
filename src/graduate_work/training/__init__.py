@@ -1,5 +1,6 @@
 """Обучение модели и MC-инференс."""
 
+from .concurrent_ensemble import ConcurrentDeepEnsembleTrainer
 from .ensemble import (
     DeepEnsembleTrainer,
     EnsembleHistory,
@@ -24,6 +25,7 @@ from .trainer import Trainer, TrainingHistory, set_seed
 __all__ = [
     "AsymmetricLossWithLogits",
     "CompositeQuantLoss",
+    "ConcurrentDeepEnsembleTrainer",
     "DeepEnsembleTrainer",
     "EnsembleHistory",
     "FocalBCEWithLogits",

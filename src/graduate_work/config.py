@@ -274,9 +274,20 @@ class TrainingConfig:
     # === Repulsive Deep Ensembles (D'Angelo NeurIPS 2021) ===
     # Function-space repulsion между членами Deep Ensemble. λ=0 →
     # обычный non-repulsive ensemble. 0.1-0.5 — рекомендуемый диапазон.
-    # Каждый i-й член (i≥1) получает штраф за RBF-схождение
-    # предсказаний с frozen-предшественниками 0..i-1.
+    #
+    # ``ensemble_repulsion_weight`` используется в:
+    #   - DeepEnsembleTrainer (sequential): репульсия от frozen 0..i-1.
+    #   - ConcurrentDeepEnsembleTrainer (concurrent): all-pairs SVGD.
+    # Симантика немного разная (см. docstring'и), но вес концептуально
+    # тот же — просто как множитель RBF-kernel'а в loss'е.
     ensemble_repulsion_weight: float = 0.1
+    # === Concurrent ensemble training ===
+    # True → все M членов живут на GPU одновременно, DataLoader
+    # итерируется 1× за эпоху. Канонический simultaneous SVGD режим
+    # (D'Angelo §4.2). VRAM × M, RAM ≈ как у sequential.
+    # False (по умолчанию) → sequential обучение, RAM-friendly,
+    # но sequential repulsion (frozen-предшественники).
+    use_concurrent_ensemble: bool = False
 
 
 @dataclass(frozen=True)

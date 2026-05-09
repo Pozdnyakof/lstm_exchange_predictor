@@ -96,3 +96,29 @@ def functional_rbf_repulsion(
         prev_out = _frozen_predict(prev, x)
         total = total + rbf_kernel_loss(current_preds, prev_out)
     return weight * total / float(len(predecessors))
+
+
+def svgd_pairwise_repulsion(
+    current_preds: torch.Tensor,
+    other_preds: list[torch.Tensor],
+    *,
+    weight: float = 0.1,
+) -> torch.Tensor:
+    """All-pairs SVGD-style repulsion для concurrent-ensemble.
+
+    В отличие от ``functional_rbf_repulsion``, который форвардит
+    frozen-модели, тут принимаем УЖЕ ВЫЧИСЛЕННЫЕ предсказания других
+    членов (с detach) — это экономит M-1 форвардов на батч в
+    ConcurrentDeepEnsembleTrainer'е.
+
+    Возвращает скаляр ``weight · mean_j RBF(current, other_j)``.
+    Каждый ``other_j`` должен быть ``.detach()``нут вызывающей стороной
+    — иначе SVGD-режим даст cross-talk через градиенты, что нарушает
+    semantics simultaneous-update D'Angelo & Fortuin §4.2.
+    """
+    if not other_preds or weight <= 0.0:
+        return current_preds.new_zeros(())
+    total = current_preds.new_zeros(())
+    for other in other_preds:
+        total = total + rbf_kernel_loss(current_preds, other)
+    return weight * total / float(len(other_preds))
