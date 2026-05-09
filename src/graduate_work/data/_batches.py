@@ -124,11 +124,43 @@ def _retry_call(
     raise RuntimeError(msg) from last_exc
 
 
+_DEDUP_IGNORE_COLUMNS = ("SYSTIME",)
+
+
+def _dedupe_rows(merged: pd.DataFrame) -> pd.DataFrame:
+    """Дедуп с учётом ВСЕХ колонок (минус SYSTIME), не только индекса.
+
+    Старая логика ``merged.index.duplicated(keep="last")`` была ошибочна
+    для HI2 / любого endpoint'а с НЕСКОЛЬКИМИ строками на один timestamp
+    (метрики hhi_volume / hhi_aggressive / hhi_passive_sell ... все имеют
+    `begin = N×D 18:40:00`). Дедуп только по индексу оставлял ОДНУ из
+    10+ метрик, теряя 90% сигнала. Баг найден в R-0052.
+
+    Решение: дедупликация по всем уникальным колонкам, исключая SYSTIME
+    (это timestamp ответа API, может отличаться между перевыкачиваниями
+    одной и той же логической строки).
+    """
+    if merged.empty:
+        return merged
+    dedup_cols = [c for c in merged.columns if c not in _DEDUP_IGNORE_COLUMNS]
+    if not dedup_cols:
+        # Нет осмысленных значащих колонок — дедуп по индексу (legacy fallback).
+        return merged[~merged.index.duplicated(keep="last")]
+    # Используем reset_index(): индекс становится колонкой, дедуп по
+    # (index + dedup_cols). Затем восстанавливаем индекс.
+    idx_name = merged.index.name or "__idx__"
+    df = merged.reset_index().rename(
+        columns={"index": idx_name} if merged.index.name is None else {},
+    )
+    df = df.drop_duplicates(subset=[idx_name, *dedup_cols], keep="last")
+    return df.set_index(idx_name).rename_axis(merged.index.name)
+
+
 def _merge_and_save(
     accumulated: list[pd.DataFrame], target_path: Path,
 ) -> tuple[pd.DataFrame, pd.Timestamp]:
     merged = pd.concat(accumulated, axis=0).sort_index()
-    merged = merged[~merged.index.duplicated(keep="last")]
+    merged = _dedupe_rows(merged)
     storage.save_raw_csv(merged, target_path)
     last = pd.Timestamp(merged.index.max())
     if last.tz is None:
