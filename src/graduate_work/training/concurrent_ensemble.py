@@ -53,8 +53,7 @@ except ImportError:  # pragma: no cover - tqdm is in deps
 
 from ..config import DataConfig, TradingConfig, TrainingConfig
 from .ensemble import EnsembleHistory, ModelFactory
-from .imbsam import select_minority_subset
-from .losses import CompositeQuantLoss, build_loss_fn, class_balanced_pos_weight
+from .losses import CompositeQuantLoss, build_loss_fn
 from .mixup import maybe_apply_mixup
 from .repulsion import svgd_pairwise_repulsion
 from .trainer import TrainingHistory, _make_loader, set_seed
@@ -180,6 +179,46 @@ class ConcurrentDeepEnsembleTrainer:
         """Список моделей (для совместимости с :func:`ensemble_predict`)."""
         return [m.model for m in self._members]
 
+    def _epoch_iteration(
+        self,
+        epoch: int,
+        train_loader: DataLoader, val_loader: DataLoader | None,
+        patience: int,
+    ) -> tuple[bool, list[float], list[float]]:
+        """Один эпоха-цикл concurrent: train + val + early-stop.
+
+        Возвращает (stop_all, train_losses, val_losses).
+        """
+        train_losses = self._epoch_concurrent(
+            train_loader, train=True, epoch=epoch, phase="train",
+        )
+        val_losses = (
+            self._epoch_concurrent(
+                val_loader, train=False, epoch=epoch, phase="val",
+            )
+            if val_loader else [math.nan] * self.ensemble_size
+        )
+        stop_all = self._update_histories(epoch, train_losses, val_losses, patience)
+        return stop_all, train_losses, val_losses
+
+    def _restore_best(self) -> None:
+        """Загрузить best_state в каждого члена + eval-mode."""
+        for ms in self._members:
+            if ms.best_state is not None:
+                ms.model.load_state_dict(ms.best_state)
+            ms.model.eval()
+
+    def _build_history(self, checkpoint_dir: Path | None) -> EnsembleHistory:
+        return EnsembleHistory(
+            member_histories=[m.history for m in self._members],
+            seeds=[m.seed for m in self._members],
+            checkpoint_paths=(
+                [checkpoint_dir / f"member_{i:02d}_seed{m.seed}.pt"
+                 for i, m in enumerate(self._members)]
+                if checkpoint_dir is not None else []
+            ),
+        )
+
     def fit(
         self,
         train_arrays: dict,
@@ -197,24 +236,13 @@ class ConcurrentDeepEnsembleTrainer:
         train_loader, val_loader = self._build_loaders(
             train_arrays, val_arrays, train_lr=train_lr, val_lr=val_lr,
         )
-        # Auto-tune (logit prior + class-balanced) для всех членов.
         self._auto_tune_all(train_arrays["y"])
-
         epochs = max(1, int(self.training_cfg.epochs))
         patience = int(self.training_cfg.early_stopping_patience)
         bar = tqdm(range(1, epochs + 1), desc="Concurrent ensemble", unit="epoch")
         for epoch in bar:
-            train_losses = self._epoch_concurrent(
-                train_loader, train=True, epoch=epoch, phase="train",
-            )
-            val_losses = (
-                self._epoch_concurrent(
-                    val_loader, train=False, epoch=epoch, phase="val",
-                )
-                if val_loader else [math.nan] * self.ensemble_size
-            )
-            stop_all = self._update_histories(
-                epoch, train_losses, val_losses, patience,
+            stop_all, train_losses, val_losses = self._epoch_iteration(
+                epoch, train_loader, val_loader, patience,
             )
             self._update_outer_bar(bar, epoch, train_losses, val_losses)
             if stop_all:
@@ -223,25 +251,10 @@ class ConcurrentDeepEnsembleTrainer:
                     self.ensemble_size, epoch,
                 )
                 break
-
-        # Восстанавливаем best_state для каждого члена.
-        for ms in self._members:
-            if ms.best_state is not None:
-                ms.model.load_state_dict(ms.best_state)
-            ms.model.eval()
-
+        self._restore_best()
         if checkpoint_dir is not None:
             self._save_checkpoints(checkpoint_dir)
-
-        return EnsembleHistory(
-            member_histories=[m.history for m in self._members],
-            seeds=[m.seed for m in self._members],
-            checkpoint_paths=(
-                [checkpoint_dir / f"member_{i:02d}_seed{m.seed}.pt"
-                 for i, m in enumerate(self._members)]
-                if checkpoint_dir is not None else []
-            ),
-        )
+        return self._build_history(checkpoint_dir)
 
     def _build_loaders(
         self,
@@ -395,6 +408,59 @@ class ConcurrentDeepEnsembleTrainer:
             for i in range(self.ensemble_size)
         ]
 
+    def _accumulate_components(
+        self, sums: dict[str, float], batch_size: int,
+    ) -> None:
+        """Sprint 2: усреднить per-component вклад по всем M членам.
+
+        Берём last_components каждого члена с CompositeQuantLoss и складываем
+        в общий sums, чтобы в логе видеть mean across-members per-component.
+        """
+        members_with_comp = [
+            m for m in self._members if isinstance(m.loss_fn, CompositeQuantLoss)
+        ]
+        if not members_with_comp:
+            return
+        n = len(members_with_comp)
+        for ms in members_with_comp:
+            for k, v in ms.loss_fn.last_components.items():
+                sums[k] = sums.get(k, 0.0) + (v * batch_size) / n
+
+    def _process_concurrent_batch(
+        self,
+        batch: tuple,
+        *,
+        train: bool,
+        totals: np.ndarray,
+        component_sums: dict[str, float],
+    ) -> int:
+        """Обработать один батч; вернуть batch_size (для накопителей)."""
+        x_cpu, y_cpu = batch[0], batch[1]
+        lr_cpu = batch[2] if len(batch) > 2 else None
+        x = x_cpu.to(self.device)
+        y = y_cpu.to(self.device)
+        lr = lr_cpu.to(self.device) if lr_cpu is not None else None
+        losses = (
+            self._train_batch(x, y, lr) if train
+            else self._eval_batch(x, y, lr)
+        )
+        bs = x.shape[0]
+        totals += np.array(losses) * bs
+        self._accumulate_components(component_sums, bs)
+        return bs
+
+    def _log_concurrent_components(
+        self, epoch: int, phase: str,
+        sums: dict[str, float], count: int,
+    ) -> None:
+        if not sums or count <= 0:
+            return
+        avg_comp = {k: round(v / count, 5) for k, v in sums.items()}
+        logger.info(
+            "  ep%02d %s components (mean across %d members): %s",
+            epoch, phase, self.ensemble_size, avg_comp,
+        )
+
     def _epoch_concurrent(
         self,
         loader: DataLoader | None,
@@ -410,24 +476,18 @@ class ConcurrentDeepEnsembleTrainer:
             ms.model.train(train)
         totals = np.zeros(self.ensemble_size, dtype=np.float64)
         count = 0
+        component_sums: dict[str, float] = {}
         bar = tqdm(loader, desc=f"  ep{epoch:02d} {phase}", unit="batch", leave=False)
         for batch in bar:
-            x_cpu, y_cpu = batch[0], batch[1]
-            lr_cpu = batch[2] if len(batch) > 2 else None
-            x = x_cpu.to(self.device)
-            y = y_cpu.to(self.device)
-            lr = lr_cpu.to(self.device) if lr_cpu is not None else None
-            losses = (
-                self._train_batch(x, y, lr) if train
-                else self._eval_batch(x, y, lr)
+            count += self._process_concurrent_batch(
+                batch, train=train, totals=totals, component_sums=component_sums,
             )
-            totals += np.array(losses) * x.shape[0]
-            count += x.shape[0]
             if hasattr(bar, "set_postfix_str"):
                 avg = totals / max(count, 1)
                 bar.set_postfix_str(
                     f"loss(min/max)={avg.min():.4f}/{avg.max():.4f}",
                 )
+        self._log_concurrent_components(epoch, phase, component_sums, count)
         return (totals / max(count, 1)).tolist()
 
     # ------------------------------------------------------------------
@@ -481,19 +541,26 @@ class ConcurrentDeepEnsembleTrainer:
             val_spread=f"{va.max() - va.min():.4f}",
         )
 
+    def _save_one_member(
+        self, idx: int, ms: _MemberState, checkpoint_dir: Path,
+    ) -> dict:
+        """Сохранить веса одного члена; вернуть entry для manifest."""
+        ckpt = checkpoint_dir / f"member_{idx:02d}_seed{ms.seed}.pt"
+        torch.save(ms.model.state_dict(), ckpt)
+        return {
+            "seed": ms.seed,
+            "checkpoint": ckpt.name,
+            "best_val_loss": float(ms.history.best_val_loss),
+            "best_epoch": int(ms.history.best_epoch),
+        }
+
     def _save_checkpoints(self, checkpoint_dir: Path) -> None:
         """Сохранить per-member чекпоинты + manifest."""
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        manifest_members = []
-        for i, ms in enumerate(self._members):
-            ckpt = checkpoint_dir / f"member_{i:02d}_seed{ms.seed}.pt"
-            torch.save(ms.model.state_dict(), ckpt)
-            manifest_members.append({
-                "seed": ms.seed,
-                "checkpoint": ckpt.name,
-                "best_val_loss": float(ms.history.best_val_loss),
-                "best_epoch": int(ms.history.best_epoch),
-            })
+        manifest_members = [
+            self._save_one_member(i, ms, checkpoint_dir)
+            for i, ms in enumerate(self._members)
+        ]
         manifest = {
             "ensemble_size": self.ensemble_size,
             "base_seed": self.base_seed,

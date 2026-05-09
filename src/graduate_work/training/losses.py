@@ -229,21 +229,33 @@ class RankICLoss(nn.Module):
     """Negative Spearman-style rank-IC между ``pred`` и ``target``.
 
     На каждом горизонте отдельно: rank-correlation сводится к Pearson на
-    soft-ranks (у вас гладкая, дифференцируемая версия). Целевая метрика
+    soft-ranks (гладкая, дифференцируемая версия). Целевая метрика
     cross-sectional ranking (Microsoft Qlib).
 
-    Loss = -mean_h pearson(soft_rank(pred_h), soft_rank(target_h)).
+    Loss = -mean_h clip(pearson(soft_rank(pred_h), soft_rank(target_h)), -clip, clip)
+
+    **clip** (Sprint 2 anti-overfit): per-horizon IC ограничен ``[-clip, clip]``,
+    чтобы предотвратить ускользание composite loss в негатив при memorize-
+    overfit. В R-0051 без clip'а train_loss уезжал до −0.008, что бесспорно
+    свидетельствовало о пересмотре loss landscape — доказательство
+    Kendall et al. CVPR 2018, что multi-task losses должны быть bounded.
 
     ``regularization`` контролирует «жёсткость» ранжирования; 1.0 — стандарт
     из torchsort/Blondel et al. (2020).
     """
 
-    def __init__(self, regularization: float = 1.0) -> None:
+    def __init__(
+        self, regularization: float = 1.0, clip: float = 0.3,
+    ) -> None:
         super().__init__()
         if regularization <= 0:
             msg = f"regularization must be positive, got {regularization}"
             raise ValueError(msg)
+        if not 0.0 < clip <= 1.0:
+            msg = f"clip must be in (0, 1], got {clip}"
+            raise ValueError(msg)
         self.regularization = float(regularization)
+        self.clip = float(clip)
 
     @staticmethod
     def _pearson(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -263,7 +275,9 @@ class RankICLoss(nn.Module):
         for h in range(n_h):
             p = _soft_rank(pred[:, h], regularization=self.regularization)
             t = _soft_rank(target[:, h], regularization=self.regularization)
-            ic_per_h.append(self._pearson(p, t))
+            ic = self._pearson(p, t)
+            # Sprint 2: clip предотвращает unbounded negative loss.
+            ic_per_h.append(ic.clamp(min=-self.clip, max=self.clip))
         return -torch.stack(ic_per_h).mean()
 
 
@@ -406,6 +420,19 @@ class CompositeQuantLoss(nn.Module):
         self.rankic = RankICLoss()
         self.sharpe = SharpeLoss(cost=cost)
         self.monotone = HorizonMonotoneRegularizer(weight=1.0)
+        # Sprint 2: дамп per-component вкладов после последнего forward'а.
+        # Trainer читает это для эпохового логирования (логировали бы баг
+        # с negative train_loss на эпохе 2, а не после 17 минут обучения).
+        self._last_components: dict[str, float] = {}
+
+    @property
+    def last_components(self) -> dict[str, float]:
+        """Снимок per-component loss-значений из последнего ``forward``.
+
+        Ключи: 'cls', 'rankic', 'sharpe', 'monotone', 'total' — присутствуют
+        только активные (с весом > 0). Значения — float (detached).
+        """
+        return dict(self._last_components)
 
     def _scale(self, name: str, value: torch.Tensor) -> torch.Tensor:
         """Масштабирование одной компоненты loss'а.
@@ -424,13 +451,24 @@ class CompositeQuantLoss(nn.Module):
         target: torch.Tensor,
         lr_target: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        loss = self._scale("bce", self.cls(logits, target))
+        comps: dict[str, float] = {}
+        cls_term = self._scale("bce", self.cls(logits, target))
+        comps["cls"] = float(cls_term.detach().item())
+        loss = cls_term
         if lr_target is not None and self._fixed_weights["rankic"] > 0:
-            loss = loss + self._scale("rankic", self.rankic(logits, lr_target))
+            rankic_term = self._scale("rankic", self.rankic(logits, lr_target))
+            comps["rankic"] = float(rankic_term.detach().item())
+            loss = loss + rankic_term
         if lr_target is not None and self._fixed_weights["sharpe"] > 0:
-            loss = loss + self._scale("sharpe", self.sharpe(logits, lr_target))
+            sharpe_term = self._scale("sharpe", self.sharpe(logits, lr_target))
+            comps["sharpe"] = float(sharpe_term.detach().item())
+            loss = loss + sharpe_term
         if self._fixed_weights["monotone"] > 0:
-            loss = loss + self._scale("monotone", self.monotone(logits))
+            mono_term = self._scale("monotone", self.monotone(logits))
+            comps["monotone"] = float(mono_term.detach().item())
+            loss = loss + mono_term
+        comps["total"] = float(loss.detach().item())
+        self._last_components = comps
         return loss
 
 

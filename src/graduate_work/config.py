@@ -213,9 +213,12 @@ class ModelConfig:
     # Для бинарного BCE с class imbalance: на тренировке logits[h] -=
     # tau · logit(P_train(UP, h)). Смещает оптимум BCE с prior'а в
     # информативную область, доказанно решает predict-the-prior collapse.
-    # 0.0 = выключено; 1.0 — рекомендация Menon (Bayes-optimal balanced
-    # error). Применяется только если ``mode='classification'``.
-    logit_adjust_tau: float = 1.0
+    # 0.0 = выключено; 1.0 — Menon's full Bayes-balanced.
+    #
+    # Sprint 2: понизили 1.0 → 0.5 после R-0051. Tau=1.0 давало overshoot
+    # mean prediction +15pp от prior — модель чрезмерно агрессивна на
+    # minority при val/test. Menon допускает [0.5, 1.0]; берём середину.
+    logit_adjust_tau: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -229,12 +232,15 @@ class TrainingConfig:
     batch_size: int = 2048  # L4 легко выдерживает 2-4K при window=30
     epochs: int = 40
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
-    # 12 эпох вместо 6: даёт обучению время преодолеть начальный
-    # «predict-the-prior» минимум и доехать до SWA-фазы. У тебя при
-    # patience=6 best обычно был на эпохе 1-2, и SWA не успевал
-    # активироваться.
-    early_stopping_patience: int = 12
+    # Sprint 2: weight_decay 1e-5 → 1e-2 (Kaddour et al. arXiv:2310.04415).
+    # При малом effective-N в финансах WD должен быть на 3 порядка больше
+    # — 1e-5 фактически не регуляризирует и допускает memorize-overfit
+    # (R-0051: train_loss → 0, val_loss → 0.27).
+    weight_decay: float = 1e-2
+    # Sprint 2: patience 12 → 5. В R-0051 best_epoch разбросан 2-19 и
+    # после best модель просто оверфитит на train. 5 эпох запаса
+    # достаточно — реальный сигнал ловится в первые 2-5 эпох.
+    early_stopping_patience: int = 5
     grad_clip: float = 1.0
     seed: int = 42
     # 100 проходов вместо 50 - точнее оценка эпистемической

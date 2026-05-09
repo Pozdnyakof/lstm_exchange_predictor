@@ -12,33 +12,71 @@ from graduate_work.training.losses import (
 )
 
 
-def test_rankic_perfect_correlation() -> None:
-    """Идеально согласованные ранги → IC=1 → loss ≈ -1."""
-    loss_fn = RankICLoss(regularization=0.1)
+def test_rankic_perfect_correlation_clipped() -> None:
+    """Идеально согласованные ранги → IC=1 → clip(IC, -0.3, 0.3)=0.3 → loss = -0.3.
+
+    Sprint 2: clip=0.3 предотвращает unbounded negative loss при memorize.
+    Без clip'а loss уезжал до -1.0 и тянул composite в негатив.
+    """
+    loss_fn = RankICLoss(regularization=0.1, clip=0.3)
     pred = torch.linspace(0.0, 10.0, steps=32).unsqueeze(-1)
     target = torch.linspace(-5.0, 5.0, steps=32).unsqueeze(-1)
     loss = loss_fn(pred, target)
-    assert loss.item() < -0.9
+    assert abs(loss.item() - (-0.3)) < 1e-5
 
 
-def test_rankic_anti_correlation() -> None:
-    """Обратные ранги → IC≈-1 → loss ≈ 1."""
-    loss_fn = RankICLoss(regularization=0.1)
+def test_rankic_anti_correlation_clipped() -> None:
+    """Обратные ранги → IC≈-1 → clip(IC, -0.3, 0.3)=-0.3 → loss = +0.3."""
+    loss_fn = RankICLoss(regularization=0.1, clip=0.3)
     pred = torch.linspace(0.0, 10.0, steps=32).unsqueeze(-1)
     target = torch.linspace(10.0, 0.0, steps=32).unsqueeze(-1)
     loss = loss_fn(pred, target)
-    assert loss.item() > 0.9
+    assert abs(loss.item() - 0.3) < 1e-5
 
 
-def test_rankic_gradient_flows() -> None:
-    """Градиент по pred должен быть ненулевой."""
-    loss_fn = RankICLoss(regularization=1.0)
-    pred = torch.randn(16, 2, requires_grad=True)
-    target = torch.randn(16, 2)
+def test_rankic_clip_validates_input() -> None:
+    """clip ∉ (0, 1] запрещён."""
+    for bad in (0.0, -0.1, 1.5):
+        try:
+            RankICLoss(clip=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError on clip={bad}")
+
+
+def test_rankic_gradient_flows_in_unclipped_zone() -> None:
+    """Градиент по pred ненулевой когда IC не упёрся в clip (случайные данные).
+
+    На randn(256, 2) корреляция близка к 0, далеко от clip=0.3 → grad есть.
+    """
+    torch.manual_seed(0)
+    loss_fn = RankICLoss(regularization=1.0, clip=0.3)
+    pred = torch.randn(256, 2, requires_grad=True)
+    target = torch.randn(256, 2)
     loss = loss_fn(pred, target)
     loss.backward()
     assert pred.grad is not None
     assert pred.grad.abs().sum().item() > 0
+
+
+def test_rankic_zero_gradient_in_clip_zone() -> None:
+    """Когда IC застряла в clip-зоне, gradient зануляется — это ИНТЕНЦИЯ
+    Sprint 2: запретить дальнейшее ускользание loss в негатив.
+    """
+    # Идеальное anti-corr → IC=-1 → clipped в -clip → нет gradient'а.
+    # Construct as leaf tensor (unsqueeze(...) returns non-leaf, поэтому
+    # сначала клонируем + requires_grad_ — это даёт настоящий leaf).
+    loss_fn = RankICLoss(regularization=0.1, clip=0.3)
+    pred = (
+        torch.linspace(0.0, 10.0, steps=32).unsqueeze(-1)
+        .clone().requires_grad_(True)
+    )
+    target = torch.linspace(10.0, 0.0, steps=32).unsqueeze(-1)
+    loss = loss_fn(pred, target)
+    loss.backward()
+    # Clamp blocks gradient за пределами зоны → околонулевой.
+    assert pred.grad is not None
+    assert pred.grad.abs().sum().item() < 1e-3
 
 
 def test_sharpe_positive_signal_negative_loss() -> None:

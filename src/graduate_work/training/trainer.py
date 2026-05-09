@@ -191,6 +191,39 @@ class Trainer:
                 eta_min=self.cfg.learning_rate * 0.01,
             )
 
+    def _epoch_iteration(
+        self,
+        epoch: int,
+        train_loader: DataLoader,
+        val_loader: DataLoader | None,
+        ctx: "_FitContext",
+        outer,
+    ) -> bool:
+        """Один эпоха-цикл: train+val эпохи, обновление best/SWA/bar.
+
+        Возвращает True если сработал early stopping.
+        """
+        train_loss = self._epoch(train_loader, train=True, epoch=epoch, phase="train")
+        val_loss = (
+            self._epoch(val_loader, train=False, epoch=epoch, phase="val")
+            if val_loader else math.nan
+        )
+        ctx.history.train_loss.append(train_loss)
+        ctx.history.val_loss.append(val_loss)
+        self._update_outer_bar(outer, epoch, train_loss, val_loss, ctx.history)
+        self._maybe_step_swa(ctx, epoch)
+        stop = self._update_best(ctx, val_loss, epoch)
+        if stop:
+            logger.info("Early stopping at epoch %d", epoch)
+        return stop
+
+    def _finalize_training(self, ctx: "_FitContext") -> None:
+        """SWA имеет приоритет над best_state, если был активирован."""
+        if ctx.swa_active and ctx.swa_model is not None:
+            self._finalize_swa(ctx)
+        elif ctx.best_state is not None:
+            self.model.load_state_dict(ctx.best_state)
+
     def fit(
         self,
         train_arrays: dict,
@@ -210,36 +243,16 @@ class Trainer:
         )
         self._auto_tune_loss(train_arrays["y"])
         self._init_lr_scheduler()
-
         history = TrainingHistory()
         ctx = _FitContext(history=history, patience=self.cfg.early_stopping_patience)
         self._init_swa(ctx)
 
-        outer = tqdm(
-            range(1, self.cfg.epochs + 1),
-            desc="Training", unit="epoch",
-        )
+        outer = tqdm(range(1, self.cfg.epochs + 1), desc="Training", unit="epoch")
         for epoch in outer:
-            train_loss = self._epoch(train_loader, train=True, epoch=epoch, phase="train")
-            val_loss = (
-                self._epoch(val_loader, train=False, epoch=epoch, phase="val")
-                if val_loader else math.nan
-            )
-            history.train_loss.append(train_loss)
-            history.val_loss.append(val_loss)
-            self._update_outer_bar(outer, epoch, train_loss, val_loss, history)
-            self._maybe_step_swa(ctx, epoch)
-            stop = self._update_best(ctx, val_loss, epoch)
-            if stop:
-                logger.info("Early stopping at epoch %d", epoch)
+            if self._epoch_iteration(epoch, train_loader, val_loader, ctx, outer):
                 break
-
         outer.close()
-        # SWA имеет приоритет над best_state, если был активирован.
-        if ctx.swa_active and ctx.swa_model is not None:
-            self._finalize_swa(ctx)
-        elif ctx.best_state is not None:
-            self.model.load_state_dict(ctx.best_state)
+        self._finalize_training(ctx)
         self._save_checkpoint(checkpoint_path)
         return history
 
@@ -388,6 +401,24 @@ class Trainer:
         torch.save(self.model.state_dict(), checkpoint_path)
         logger.info("Saved checkpoint to %s", checkpoint_path)
 
+    def _accumulate_components(
+        self, sums: dict[str, float], batch_size: int,
+    ) -> None:
+        """Sprint 2: накопить per-component вклад из последнего forward'а."""
+        if not isinstance(self.loss_fn, CompositeQuantLoss):
+            return
+        for k, v in self.loss_fn.last_components.items():
+            sums[k] = sums.get(k, 0.0) + v * batch_size
+
+    @staticmethod
+    def _log_components(
+        epoch: int, phase: str, sums: dict[str, float], count: int,
+    ) -> None:
+        if not sums or count <= 0:
+            return
+        avg = {k: round(v / count, 5) for k, v in sums.items()}
+        logger.info("  ep%02d %s components: %s", epoch, phase, avg)
+
     def _epoch(
         self,
         loader: DataLoader | None,
@@ -401,19 +432,19 @@ class Trainer:
         self.model.train(train)
         total = 0.0
         count = 0
+        component_sums: dict[str, float] = {}
         bar = tqdm(
-            loader,
-            desc=f"  ep{epoch:02d} {phase}",
-            unit="batch",
-            leave=False,
+            loader, desc=f"  ep{epoch:02d} {phase}", unit="batch", leave=False,
         )
         for batch in bar:
             x, y, lr = (batch[0], batch[1], batch[2] if len(batch) > 2 else None)
             batch_loss = self._step(x, y, lr=lr, train=train)
             total += batch_loss * x.shape[0]
             count += x.shape[0]
+            self._accumulate_components(component_sums, x.shape[0])
             if hasattr(bar, "set_postfix_str"):
                 bar.set_postfix_str(f"loss={total / max(count, 1):.5f}")
+        self._log_components(epoch, phase, component_sums, count)
         return total / max(count, 1)
 
     def _call_loss(
