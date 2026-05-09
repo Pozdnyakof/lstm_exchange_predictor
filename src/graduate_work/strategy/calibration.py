@@ -208,6 +208,54 @@ def _normalize_split_df(val_split_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def extract_lr_array(
+    split_df: pd.DataFrame,
+    dataset: dict,
+    horizons: tuple[int, ...],
+) -> np.ndarray:
+    """Wide-form (N, H) массив сырых лог-доходностей под dataset['y'].
+
+    Аналог :func:`attach_lr_targets`, но возвращает np.ndarray ровно той
+    же формы и порядка, что ``dataset['y']`` — для прямой подачи в
+    ``Trainer.fit(train_lr=..., val_lr=...)`` под composite loss
+    (RankIC + Sharpe).
+
+    Если для какого-то окна нет lr (NaN или ключ не найден) — заполняем
+    нулём, что нейтрально для Sharpe и почти нейтрально для RankIC.
+    """
+    n, h = dataset["y"].shape
+    if n == 0:
+        return np.zeros((0, len(horizons)), dtype=np.float32)
+    df = _normalize_split_df(split_df)
+    by_key: dict[tuple, int] = {
+        (int(t.value), str(tk)): i
+        for i, (t, tk) in enumerate(zip(df["timestamp"], df["ticker"]))
+    }
+    tickers = dataset["ticker"]
+    timestamps = pd.to_datetime(dataset["timestamp"], utc=True)
+    lr_cols = [f"lr_h{hz}" for hz in horizons]
+    available = [c for c in lr_cols if c in df.columns]
+    if not available:
+        logger.warning(
+            "Нет колонок lr_h* в split_df — extract_lr_array вернёт нули. "
+            "Composite loss RankIC/Sharpe компоненты будут неактивны.",
+        )
+        return np.zeros((n, len(horizons)), dtype=np.float32)
+
+    out = np.zeros((n, len(horizons)), dtype=np.float32)
+    for i in range(n):
+        ts = pd.Timestamp(timestamps[i])
+        ticker = str(tickers[i])
+        idx = by_key.get((ts.value, ticker))
+        if idx is None:
+            continue
+        row = df.iloc[idx]
+        for j, col in enumerate(lr_cols):
+            if col in available and pd.notna(row[col]):
+                out[i, j] = float(row[col])
+    return out
+
+
 def attach_lr_targets(
     val_split_df: pd.DataFrame,
     val_dataset: dict,

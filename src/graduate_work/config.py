@@ -192,6 +192,20 @@ class ModelConfig:
     # количество, и они попадают в последние n_exo колонок входа.
     timexer_n_exo: int = 0
 
+    # === iTransformer (architecture="itransformer") ===
+    # Liu et al., ICLR 2024 (arXiv:2310.06625). Inverted attention:
+    # каждая variate (фича) — один токен d_model. Self-attention идёт
+    # ПО КАНАЛАМ, что явно моделирует межканальные зависимости —
+    # критично для микроструктурных фич (OFI, спрэд, imbalance сильно
+    # скоррелированы). Дефолты подобраны под input_dim≈80 каналов:
+    # d_model=128 даёт ~10K параметров на attention layer.
+    itransformer_seq_len: int = 384
+    itransformer_d_model: int = 128
+    itransformer_n_layers: int = 3
+    itransformer_n_heads: int = 8
+    itransformer_d_ff: int = 256
+    itransformer_dropout: float = 0.3
+
 
 @dataclass(frozen=True)
 class TrainingConfig:
@@ -264,11 +278,20 @@ class TradingConfig:
     selection_correction: str = "sidak"
 
     # === LOSS ===
-    # "bce"   — обычный binary cross-entropy (дефолт для классификации)
-    # "focal" — focal-loss; полезен при дисбалансе классов
+    # "bce"       — обычный binary cross-entropy (дефолт для классификации)
+    # "focal"     — focal-loss; полезен при дисбалансе классов
+    # "composite" — α·BCE + β·RankIC + γ·Sharpe + δ·Monotone (quant-loss)
     loss_objective: str = "bce"
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
+    # Веса композитного quant-loss'а. RankIC оптимизирует cross-sectional
+    # ranking (Microsoft Qlib); Sharpe прямо оптимизирует risk-adjusted
+    # PnL (Lim-Zohren-Roberts 2019); monotone штрафует немонотонность
+    # вероятностей по горизонтам. BCE удерживает калибровку.
+    composite_bce_weight: float = 1.0
+    composite_rankic_weight: float = 0.5
+    composite_sharpe_weight: float = 0.3
+    composite_monotone_weight: float = 0.1
     # Случайные портфели:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0

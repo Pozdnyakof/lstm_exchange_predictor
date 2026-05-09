@@ -1,5 +1,10 @@
 """Модуль 3 (часть 2): преобразование MC-прогнозов в торговые сигналы."""
 
+from .adaptive_conformal import (
+    ACIState,
+    AdaptiveConformalPredictor,
+    aci_signals_to_actions,
+)
 from .calibration import (
     CalibratedThreshold,
     attach_actual_targets,
@@ -8,6 +13,7 @@ from .calibration import (
     calibrate_bayes_threshold,
     calibrate_min_expected_return,
     estimate_gain_from_lr,
+    extract_lr_array,
 )
 from .conformal import ConformalCalibration, ConformalSignalGenerator
 from .consensus import (
@@ -19,11 +25,14 @@ from .consensus import (
 from .signals import SignalGenerator, build_predictions_frame
 
 __all__ = [
+    "ACIState",
+    "AdaptiveConformalPredictor",
     "CalibratedThreshold",
     "ConformalCalibration",
     "ConformalSignalGenerator",
     "ConsensusThresholds",
     "SignalGenerator",
+    "aci_signals_to_actions",
     "apply_consensus_thresholds",
     "attach_actual_targets",
     "attach_lr_targets",
@@ -34,4 +43,5 @@ __all__ = [
     "calibrate_min_expected_return",
     "consensus_summary",
     "estimate_gain_from_lr",
+    "extract_lr_array",
 ]

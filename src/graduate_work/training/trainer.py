@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover - tqdm в зависимостях
         return it
 
 from ..config import DataConfig, TradingConfig, TrainingConfig
-from .losses import WeightedBCEWithLogits, build_loss_fn
+from .losses import CompositeQuantLoss, WeightedBCEWithLogits, build_loss_fn
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +47,31 @@ def _make_loader(
     batch_size: int,
     *,
     shuffle: bool,
+    lr_array: np.ndarray | None = None,
 ) -> DataLoader | None:
+    """Сформировать DataLoader для (x, y) или (x, y, lr).
+
+    ``lr_array`` опционален: при composite-loss он несёт сырые
+    лог-доходности (B, H) для RankIC/Sharpe-компонент. Если None —
+    собираем 2-tuple, как раньше.
+    """
     if arrays["x"].shape[0] == 0:
         return None
     x = torch.from_numpy(arrays["x"]).float()
     y = torch.from_numpy(arrays["y"]).float()
+    if lr_array is not None:
+        if lr_array.shape != arrays["y"].shape:
+            msg = (
+                f"lr_array shape {lr_array.shape} must match y shape "
+                f"{arrays['y'].shape}"
+            )
+            raise ValueError(msg)
+        lr = torch.from_numpy(lr_array).float()
+        dataset = TensorDataset(x, y, lr)
+    else:
+        dataset = TensorDataset(x, y)
     return DataLoader(
-        TensorDataset(x, y),
+        dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=False,
@@ -110,9 +128,27 @@ class Trainer:
         val_arrays: dict,
         *,
         checkpoint_path: Path | None = None,
+        train_lr: np.ndarray | None = None,
+        val_lr: np.ndarray | None = None,
     ) -> TrainingHistory:
-        train_loader = _make_loader(train_arrays, self.cfg.batch_size, shuffle=True)
-        val_loader = _make_loader(val_arrays, self.cfg.batch_size, shuffle=False)
+        """Обучить модель.
+
+        ``train_lr``/``val_lr`` — опциональные сырые лог-доходности (B, H);
+        нужны только для :class:`CompositeQuantLoss` (RankIC + Sharpe).
+        Если loss их не использует — передаваемые массивы игнорируются.
+        """
+        needs_lr = isinstance(self.loss_fn, CompositeQuantLoss)
+        if needs_lr and (train_lr is None or val_lr is None):
+            logger.warning(
+                "CompositeQuantLoss активен, но lr-target не передан — "
+                "RankIC/Sharpe компоненты будут пропущены.",
+            )
+        train_loader = _make_loader(
+            train_arrays, self.cfg.batch_size, shuffle=True, lr_array=train_lr,
+        )
+        val_loader = _make_loader(
+            val_arrays, self.cfg.batch_size, shuffle=False, lr_array=val_lr,
+        )
         if train_loader is None:
             msg = "Training set is empty"
             raise ValueError(msg)
@@ -279,26 +315,44 @@ class Trainer:
             unit="batch",
             leave=False,
         )
-        for x, y in bar:
-            batch_loss = self._step(x, y, train=train)
+        for batch in bar:
+            x, y, lr = (batch[0], batch[1], batch[2] if len(batch) > 2 else None)
+            batch_loss = self._step(x, y, lr=lr, train=train)
             total += batch_loss * x.shape[0]
             count += x.shape[0]
             if hasattr(bar, "set_postfix_str"):
                 bar.set_postfix_str(f"loss={total / max(count, 1):.5f}")
         return total / max(count, 1)
 
-    def _step(self, x: torch.Tensor, y: torch.Tensor, *, train: bool) -> float:
+    def _compute_loss(
+        self,
+        preds: torch.Tensor,
+        y: torch.Tensor,
+        lr: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Унифицированный вызов loss с учётом сигнатуры (2 / 3 args)."""
+        if isinstance(self.loss_fn, CompositeQuantLoss):
+            return self.loss_fn(preds, y, lr)
+        if self._is_classification:
+            # BCE / Focal: (logits, target, weights). Передаём None.
+            return self.loss_fn(preds, y, None)
+        return self.loss_fn(preds, y)
+
+    def _step(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        lr: torch.Tensor | None = None,
+        train: bool,
+    ) -> float:
         x = x.to(self.device)
         y = y.to(self.device)
+        if lr is not None:
+            lr = lr.to(self.device)
         with torch.set_grad_enabled(train):
             preds = self.model(x)
-            # BCE / Focal принимают 3 аргумента (logits, target, weights);
-            # Huber - 2 аргумента (preds, target). Унифицируем через
-            # фиксированный Optional[weights].
-            if self._is_classification:
-                loss = self.loss_fn(preds, y, None)
-            else:
-                loss = self.loss_fn(preds, y)
+            loss = self._compute_loss(preds, y, lr)
             if train:
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
