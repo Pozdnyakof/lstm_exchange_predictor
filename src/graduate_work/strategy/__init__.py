@@ -24,6 +24,14 @@ from .consensus import (
     consensus_summary,
 )
 from .signals import SignalGenerator, build_predictions_frame
+from .threshold_strategies import (
+    apply_isotonic_calibration,
+    fit_isotonic_per_horizon,
+    max_pnl_threshold,
+    signals_argmax_threshold,
+    signals_per_horizon_threshold,
+    top_k_threshold,
+)
 
 __all__ = [
     "ACIState",
@@ -36,6 +44,7 @@ __all__ = [
     "SignalGenerator",
     "aci_signals_to_actions",
     "apply_consensus_thresholds",
+    "apply_isotonic_calibration",
     "attach_actual_targets",
     "attach_lr_targets",
     "bayes_threshold",
@@ -46,4 +55,9 @@ __all__ = [
     "consensus_summary",
     "estimate_gain_from_lr",
     "extract_lr_array",
+    "fit_isotonic_per_horizon",
+    "max_pnl_threshold",
+    "signals_argmax_threshold",
+    "signals_per_horizon_threshold",
+    "top_k_threshold",
 ]
