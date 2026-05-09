@@ -303,6 +303,8 @@ def order_to_trade_ratio(
 def hi2_features(
     hi2: pd.DataFrame,
     target_index: pd.DatetimeIndex,
+    *,
+    availability_delay: pd.Timedelta = pd.Timedelta(days=1),
 ) -> pd.DataFrame:
     """Daily Herfindahl-индекс концентрации торгов → bar-level через ffill.
 
@@ -310,21 +312,54 @@ def hi2_features(
     что часто предшествует резким движениям. Низкий HI2 = равномерное
     распределение = более стабильный регим.
 
-    Колонки HI2: ``tradedate, secid, metric, value, reference``.
-    Метрик может быть несколько (hhi_aggressive, hhi_passive, ...) —
-    pivot'им по metric, ffill на bar-grid.
+    Колонки HI2: ``tradedate, tradetime, secid, metric, value, reference``.
+    Множество metric'ов на один (date, secid). После R-0052 fix — 11 метрик.
+
+    **R-0054 ANTI-LEAKAGE FIX**: HI2 для дня D физически вычисляется в
+    18:40 UTC (конец сессии). Старая реализация использовала
+    ``tradedate`` (= 00:00 UTC дня D) как pivot index → ffill на бары
+    07:00 утра ТОГО ЖЕ дня → модель в 07:00 уже видела значение,
+    которое будет посчитано лишь в 18:40 (look-ahead 11 часов).
+
+    Fix: используем РЕАЛЬНЫЙ timestamp end-of-session ИЗ ИНДЕКСА
+    (если есть), либо собираем из ``tradedate + tradetime``. Затем
+    добавляем ``availability_delay`` (+1 день по умолчанию) — HI2 для
+    дня D становится доступен на барах дня D+1. Гарантированный zero
+    look-ahead.
     """
     out = pd.DataFrame(index=target_index)
-    if hi2 is None or hi2.empty or "tradedate" not in hi2.columns:
+    if hi2 is None or hi2.empty:
+        return out
+    if "metric" not in hi2.columns or "value" not in hi2.columns:
         return out
     df = hi2.copy()
-    df["tradedate"] = pd.to_datetime(df["tradedate"], utc=True, errors="coerce")
-    df = df.dropna(subset=["tradedate"])
-    if "metric" not in df.columns or "value" not in df.columns:
+    # Реальный timestamp вычисления HI2 (end-of-session). Приоритет:
+    # 1. df.index, если это DatetimeIndex (как делает _normalize_supercandle_index)
+    # 2. tradedate + tradetime
+    # 3. tradedate только (fallback, midnight)
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.notna().all():
+        ts = pd.to_datetime(df.index, utc=True)
+    elif "tradedate" in df.columns and "tradetime" in df.columns:
+        ts = pd.to_datetime(
+            df["tradedate"].astype(str) + " " + df["tradetime"].astype(str),
+            utc=True, errors="coerce",
+        )
+    elif "tradedate" in df.columns:
+        ts = pd.to_datetime(df["tradedate"], utc=True, errors="coerce")
+    else:
+        return out
+    df = df.assign(_ts=ts).dropna(subset=["_ts"])
+    if df.empty:
         return out
     pivot = df.pivot_table(
-        index="tradedate", columns="metric", values="value", aggfunc="last",
+        index="_ts", columns="metric", values="value", aggfunc="last",
     )
+    # Нормализуем к 00:00 ДНЯ публикации, потом сдвигаем на delay.
+    # HI2 для дня D вычислен в 18:40 D → normalize → 00:00 D → +1day
+    # → 00:00 D+1. Все бары D+1 (включая утренние) видят HI2 от D.
+    # Это корректная семантика: модель к открытию следующего дня
+    # уже знает агрегаты прошлого дня.
+    pivot.index = pivot.index.normalize() + availability_delay
     aligned = pivot.reindex(target_index, method="ffill")
     for metric_name in aligned.columns:
         col = f"aps_hi2_{str(metric_name).lower()}"
