@@ -316,9 +316,243 @@ def aci_signals_to_actions(
     return pd.concat(sessions, ignore_index=True)
 
 
+class DtACIPredictor:
+    """DtACI: Dynamically-tuned Adaptive Conformal Inference.
+
+    Gibbs & Candès, **JMLR 2024**, *Conformal Inference for Online
+    Prediction with Arbitrary Distribution Shifts*
+    ([arXiv:2208.08401](https://arxiv.org/abs/2208.08401)).
+
+    Расширение ACI на «grid γ-кандидатов»: вместо одного фиксированного
+    learning rate γ держим K разных γ_k и онлайн-выбираем взвешенную
+    комбинацию через exponential weighted averaging. При mis-specified
+    γ (как было в R-0050: фиксированный γ=0.005 → α упёрлось в 0.5)
+    DtACI автоматически переключается на γ, дающий лучшее покрытие.
+
+    На каждом шаге:
+    1. Каждый эксперт k поддерживает свой α_t^(k) по правилу ACI с γ_k.
+    2. После наблюдения actual: считаем pinball loss каждого эксперта.
+    3. Веса экспертов w_k ∝ exp(−η · cumulative_loss_k).
+    4. Финальное α = Σ_k w_k · α_t^(k).
+
+    Per-horizon — каждый горизонт держит свой набор экспертов.
+    """
+
+    def __init__(
+        self,
+        *,
+        target_alpha: float = 0.1,
+        gammas: tuple[float, ...] = (0.001, 0.005, 0.01, 0.05),
+        eta: float = 0.1,
+        alpha_min: float = 0.001,
+        alpha_max: float = 0.5,
+    ) -> None:
+        if not 0.0 < target_alpha < 1.0:
+            msg = f"target_alpha must be in (0, 1), got {target_alpha}"
+            raise ValueError(msg)
+        if not gammas:
+            msg = "gammas must be non-empty"
+            raise ValueError(msg)
+        if any(g <= 0 for g in gammas):
+            msg = f"all gammas must be > 0, got {gammas}"
+            raise ValueError(msg)
+        if eta <= 0:
+            msg = f"eta must be > 0, got {eta}"
+            raise ValueError(msg)
+        self.target_alpha = float(target_alpha)
+        self.gammas = tuple(float(g) for g in gammas)
+        self.eta = float(eta)
+        self.alpha_min = float(alpha_min)
+        self.alpha_max = float(alpha_max)
+        # Per-horizon state: alphas[horizon] = list[float] длины K (по экспертам);
+        # weights[horizon] = list[float] длины K; cumulative_loss[horizon] = ...;
+        # scores[horizon] = ndarray (warm-start scores).
+        self._alphas: dict[int, list[float]] = {}
+        self._weights: dict[int, list[float]] = {}
+        self._cum_loss: dict[int, list[float]] = {}
+        self._scores: dict[int, np.ndarray] = {}
+        self._n_observed: dict[int, int] = {}
+
+    @property
+    def state_summary(self) -> pd.DataFrame:
+        """DataFrame: для каждого горизонта — текущая комбинированная α
+        и веса экспертов."""
+        rows = []
+        for h in sorted(self._alphas):
+            alpha_combined = self._combined_alpha(h)
+            row = {
+                "horizon": h,
+                "alpha_combined": alpha_combined,
+                "n_observed": self._n_observed[h],
+            }
+            for k, gamma in enumerate(self.gammas):
+                row[f"alpha_g={gamma:.3f}"] = self._alphas[h][k]
+                row[f"w_g={gamma:.3f}"] = self._weights[h][k]
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _scores_for_horizon(sub: pd.DataFrame) -> np.ndarray:
+        positives = sub[sub["actual"] >= 0.5]
+        source = positives if not positives.empty else sub
+        scores = 1.0 - source["mean"].to_numpy(dtype=np.float64)
+        scores = scores[np.isfinite(scores)]
+        if scores.size == 0:
+            return np.array([0.5], dtype=np.float64)
+        return scores
+
+    def calibrate(
+        self,
+        val_predictions: pd.DataFrame,
+        val_targets: pd.DataFrame,
+    ) -> None:
+        """Warm-start с val-данных: одна и та же conformal-база для всех экспертов."""
+        if val_predictions.empty or val_targets.empty:
+            msg = "Cannot calibrate DtACI on empty validation data"
+            raise ValueError(msg)
+        merged = val_predictions.merge(
+            val_targets, on=["timestamp", "ticker", "horizon"], how="inner",
+        )
+        if merged.empty or "actual" not in merged.columns:
+            msg = "Validation merge produced empty frame; check column names"
+            raise ValueError(msg)
+        k = len(self.gammas)
+        for h, sub in merged.groupby("horizon"):
+            self._scores[int(h)] = self._scores_for_horizon(sub)
+            self._alphas[int(h)] = [self.target_alpha] * k
+            self._weights[int(h)] = [1.0 / k] * k
+            self._cum_loss[int(h)] = [0.0] * k
+            self._n_observed[int(h)] = 0
+        logger.info(
+            "DtACI calibrated on %d horizons; gammas=%s",
+            len(self._scores), self.gammas,
+        )
+
+    def _combined_alpha(self, horizon: int) -> float:
+        """Взвешенная комбинация α по экспертам (нормализованные веса)."""
+        ws = np.asarray(self._weights[horizon])
+        alphas = np.asarray(self._alphas[horizon])
+        norm = ws.sum()
+        if norm <= 1e-12:
+            return float(self.target_alpha)
+        return float((ws * alphas).sum() / norm)
+
+    def _expert_threshold(self, horizon: int, alpha: float) -> float:
+        """Threshold под конкретное α (как в обычном ACI)."""
+        scores = self._scores[horizon]
+        n = scores.size
+        level = min(1.0, (1.0 - alpha) * (1 + 1 / max(n, 1)))
+        q = float(np.quantile(scores, level))
+        return float(np.clip(1.0 - q, 0.0, 1.0))
+
+    def threshold(self, horizon: int) -> float:
+        """Threshold по комбинированной α."""
+        if horizon not in self._alphas:
+            msg = f"horizon {horizon} not calibrated"
+            raise KeyError(msg)
+        return self._expert_threshold(horizon, self._combined_alpha(horizon))
+
+    def _pinball_loss(
+        self, alpha: float, miscovered: int,
+    ) -> float:
+        """Pinball loss для онлайн-обучения весов экспертов.
+
+        ``alpha · (1 - miscovered)`` если covered (хотим α малым),
+        ``(1 - alpha) · miscovered`` если miscovered (хотим α меньше
+        чтобы быть готовым к промахам — но здесь мы не покрыли).
+        Стандарт DtACI Gibbs-Candès JMLR 2024 §3.
+        """
+        return float(alpha * (1 - miscovered) + (1.0 - alpha) * miscovered)
+
+    def update(
+        self,
+        *,
+        predicted_prob: float,
+        actual: float,
+        horizon: int,
+    ) -> None:
+        """Online-update всех экспертов и весов."""
+        if horizon not in self._alphas:
+            msg = f"horizon {horizon} not calibrated"
+            raise KeyError(msg)
+        positive = float(actual) >= 0.5
+        self._n_observed[horizon] += 1
+        for k, gamma in enumerate(self.gammas):
+            alpha_k = self._alphas[horizon][k]
+            thr_k = self._expert_threshold(horizon, alpha_k)
+            miscov = int(positive and (float(predicted_prob) < thr_k))
+            # ACI rule
+            new_alpha = alpha_k + gamma * (self.target_alpha - miscov)
+            self._alphas[horizon][k] = float(
+                np.clip(new_alpha, self.alpha_min, self.alpha_max),
+            )
+            # Per-expert pinball loss → cumulative → exp-weights.
+            self._cum_loss[horizon][k] += self._pinball_loss(alpha_k, miscov)
+        # Renormalize веса как softmax по −η · cum_loss (стандарт EWA).
+        cum = np.asarray(self._cum_loss[horizon])
+        log_w = -self.eta * (cum - cum.min())  # shift для numerical stability
+        w = np.exp(log_w)
+        w = w / max(w.sum(), 1e-12)
+        self._weights[horizon] = w.tolist()
+
+    def _replay_step(self, row, *, idx: int, buffers: dict) -> None:
+        """Один шаг replay-стрима в-place, аналог ACI._replay_step."""
+        h = int(row.horizon)
+        if h not in self._alphas:
+            buffers["thresholds"][idx] = 1.0
+            buffers["alphas"][idx] = self.target_alpha
+            return
+        thr = self.threshold(h)
+        buffers["thresholds"][idx] = thr
+        buffers["alphas"][idx] = self._combined_alpha(h)
+        signal = int(float(row.mean) > thr)
+        buffers["signals"][idx] = signal
+        actual = getattr(row, "actual", float("nan"))
+        if np.isnan(actual):
+            return
+        self.update(
+            predicted_prob=float(row.mean), actual=float(actual), horizon=h,
+        )
+        if int(actual >= 0.5) == 1 and signal == 0:
+            buffers["miscov"][idx] = 1
+
+    def replay(
+        self,
+        predictions: pd.DataFrame,
+        actuals: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Offline-симуляция аналогично ACI.replay, с DtACI-обновлением."""
+        if predictions.empty:
+            return predictions.assign(
+                threshold=pd.Series(dtype=float),
+                alpha=pd.Series(dtype=float),
+                signal=pd.Series(dtype=int),
+                miscovered=pd.Series(dtype=int),
+            )
+        merged = predictions.merge(
+            actuals[["timestamp", "ticker", "horizon", "actual"]],
+            on=["timestamp", "ticker", "horizon"], how="left",
+        ).sort_values(["timestamp", "ticker", "horizon"]).reset_index(drop=True)
+        n = len(merged)
+        buffers = {
+            "thresholds": np.zeros(n, dtype=np.float64),
+            "alphas": np.zeros(n, dtype=np.float64),
+            "signals": np.zeros(n, dtype=np.int8),
+            "miscov": np.zeros(n, dtype=np.int8),
+        }
+        for i, row in enumerate(merged.itertuples(index=False)):
+            self._replay_step(row, idx=i, buffers=buffers)
+        merged["threshold"] = buffers["thresholds"]
+        merged["alpha"] = buffers["alphas"]
+        merged["signal"] = buffers["signals"]
+        merged["miscovered"] = buffers["miscov"]
+        return merged
+
+
 __all__ = [
     "ACIState",
     "AdaptiveConformalPredictor",
+    "DtACIPredictor",
     "aci_signals_to_actions",
 ]
 

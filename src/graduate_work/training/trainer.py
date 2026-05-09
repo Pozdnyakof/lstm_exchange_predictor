@@ -21,7 +21,15 @@ except ImportError:  # pragma: no cover - tqdm в зависимостях
         return it
 
 from ..config import DataConfig, TradingConfig, TrainingConfig
-from .losses import CompositeQuantLoss, WeightedBCEWithLogits, build_loss_fn
+from .imbsam import ImbSAMOptimizer, select_minority_subset
+from .losses import (
+    CompositeQuantLoss,
+    WeightedBCEWithLogits,
+    build_loss_fn,
+    class_balanced_pos_weight,
+)
+from .mixup import maybe_apply_mixup
+from .repulsion import functional_rbf_repulsion
 
 logger = logging.getLogger(__name__)
 
@@ -96,31 +104,92 @@ class Trainer:
         data_cfg: DataConfig | None = None,
         trading_cfg: TradingConfig | None = None,
         device: str | None = None,
+        repulsion_predecessors: list[nn.Module] | None = None,
+        repulsion_weight: float = 0.0,
     ) -> None:
         self.cfg = cfg
         self.data_cfg = data_cfg
         self.trading_cfg = trading_cfg
-        self.device = torch.device(
-            device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu"),
+        self.device = self._resolve_device(device)
+        # Repulsive Deep Ensembles (Sprint C1, D'Angelo NeurIPS 2021).
+        self._repulsion_predecessors: list[nn.Module] = list(
+            repulsion_predecessors or [],
         )
+        self._repulsion_weight = float(repulsion_weight)
         self.model = model.to(self.device)
-        opt_cls = torch.optim.AdamW if cfg.optimizer == "adamw" else torch.optim.Adam
-        self.optimizer = opt_cls(
-            self.model.parameters(),
-            lr=cfg.learning_rate,
-            weight_decay=cfg.weight_decay,
+        self.loss_fn, self._is_classification = self._build_loss(
+            data_cfg, cfg, trading_cfg,
         )
-        # Loss выбирается по режиму:
-        #   classification (BCE / Focal) - бинарные метки;
-        #   regression (Huber, δ автоподбор в fit()) - лог-доходность.
-        if data_cfg is not None and data_cfg.mode == "classification":
-            self.loss_fn: nn.Module = build_loss_fn(data_cfg, cfg, trading_cfg)
-            self._is_classification = True
-        else:
-            self.loss_fn = nn.HuberLoss(reduction="mean", delta=1.0)
-            self._is_classification = False
-        # CosineAnnealing-планировщик опционально (cfg.scheduler).
+        self.optimizer = self._build_optimizer(cfg)
+        self._imbsam: ImbSAMOptimizer | None = (
+            ImbSAMOptimizer(self.optimizer, self.model, rho=float(cfg.imbsam_rho))
+            if getattr(cfg, "use_imbsam", False) else None
+        )
         self.lr_scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+
+    @staticmethod
+    def _resolve_device(device: str | None) -> torch.device:
+        if device is not None:
+            return torch.device(device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _build_loss(
+        self,
+        data_cfg: DataConfig | None,
+        cfg: TrainingConfig,
+        trading_cfg: TradingConfig | None,
+    ) -> tuple[nn.Module, bool]:
+        """Собрать loss + флаг classification, перенести на device."""
+        if data_cfg is not None and data_cfg.mode == "classification":
+            loss = build_loss_fn(data_cfg, cfg, trading_cfg)
+            is_cls = True
+        else:
+            loss = nn.HuberLoss(reduction="mean", delta=1.0)
+            is_cls = False
+        return loss.to(self.device), is_cls
+
+    def _build_optimizer(self, cfg: TrainingConfig) -> torch.optim.Optimizer:
+        """AdamW/Adam над параметрами модели + loss_fn (для UW log_var)."""
+        opt_cls = torch.optim.AdamW if cfg.optimizer == "adamw" else torch.optim.Adam
+        params = list(self.model.parameters()) + [
+            p for p in self.loss_fn.parameters() if p.requires_grad
+        ]
+        return opt_cls(params, lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+
+    def _build_loaders(
+        self,
+        train_arrays: dict,
+        val_arrays: dict,
+        *,
+        train_lr: np.ndarray | None,
+        val_lr: np.ndarray | None,
+    ) -> tuple[DataLoader, DataLoader | None]:
+        """Собрать train + val DataLoader'ы с учётом опциональных lr-arrays."""
+        if isinstance(self.loss_fn, CompositeQuantLoss):
+            if train_lr is None or val_lr is None:
+                logger.warning(
+                    "CompositeQuantLoss активен, но lr-target не передан — "
+                    "RankIC/Sharpe компоненты будут пропущены.",
+                )
+        train_loader = _make_loader(
+            train_arrays, self.cfg.batch_size, shuffle=True, lr_array=train_lr,
+        )
+        val_loader = _make_loader(
+            val_arrays, self.cfg.batch_size, shuffle=False, lr_array=val_lr,
+        )
+        if train_loader is None:
+            msg = "Training set is empty"
+            raise ValueError(msg)
+        return train_loader, val_loader
+
+    def _init_lr_scheduler(self) -> None:
+        """CosineAnnealingLR (T2.2). При early stopping прерывается."""
+        if self.cfg.scheduler == "cosine":
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=max(1, self.cfg.epochs),
+                eta_min=self.cfg.learning_rate * 0.01,
+            )
 
     def fit(
         self,
@@ -135,34 +204,12 @@ class Trainer:
 
         ``train_lr``/``val_lr`` — опциональные сырые лог-доходности (B, H);
         нужны только для :class:`CompositeQuantLoss` (RankIC + Sharpe).
-        Если loss их не использует — передаваемые массивы игнорируются.
         """
-        needs_lr = isinstance(self.loss_fn, CompositeQuantLoss)
-        if needs_lr and (train_lr is None or val_lr is None):
-            logger.warning(
-                "CompositeQuantLoss активен, но lr-target не передан — "
-                "RankIC/Sharpe компоненты будут пропущены.",
-            )
-        train_loader = _make_loader(
-            train_arrays, self.cfg.batch_size, shuffle=True, lr_array=train_lr,
+        train_loader, val_loader = self._build_loaders(
+            train_arrays, val_arrays, train_lr=train_lr, val_lr=val_lr,
         )
-        val_loader = _make_loader(
-            val_arrays, self.cfg.batch_size, shuffle=False, lr_array=val_lr,
-        )
-        if train_loader is None:
-            msg = "Training set is empty"
-            raise ValueError(msg)
-
         self._auto_tune_loss(train_arrays["y"])
-
-        # T2.2: CosineAnnealingLR-планировщик. Длится все epochs;
-        # при early stopping просто прерывается на полпути.
-        if self.cfg.scheduler == "cosine":
-            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=max(1, self.cfg.epochs),
-                eta_min=self.cfg.learning_rate * 0.01,
-            )
+        self._init_lr_scheduler()
 
         history = TrainingHistory()
         ctx = _FitContext(history=history, patience=self.cfg.early_stopping_patience)
@@ -196,29 +243,74 @@ class Trainer:
         self._save_checkpoint(checkpoint_path)
         return history
 
+    def _compute_pos_weight(self, y_train: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Вернуть (p_up, pos_weight) per-horizon.
+
+        ``trading_cfg.use_class_balanced_pos_weight=True`` →
+        Class-Balanced (Cui CVPR 2019, β=0.999); иначе legacy (1-P)/P.
+        """
+        p_up = np.clip(y_train.mean(axis=0), 0.05, 0.95).astype(np.float32)
+        if (
+            self.trading_cfg is not None
+            and getattr(self.trading_cfg, "use_class_balanced_pos_weight", False)
+        ):
+            pos_weight = class_balanced_pos_weight(
+                y_train, beta=float(self.trading_cfg.class_balanced_beta),
+            )
+            logger.info(
+                "Class-Balanced pos_weight per horizon: %s (P(UP)=%s, β=%.3f)",
+                np.round(pos_weight, 3).tolist(),
+                np.round(p_up, 3).tolist(),
+                float(self.trading_cfg.class_balanced_beta),
+            )
+        else:
+            pos_weight = ((1.0 - p_up) / p_up).astype(np.float32)
+            logger.info(
+                "Legacy pos_weight per horizon: %s (P(UP)=%s)",
+                np.round(pos_weight, 3).tolist(),
+                np.round(p_up, 3).tolist(),
+            )
+        return p_up, pos_weight
+
+    def _set_logit_prior(self, p_up: np.ndarray) -> None:
+        """Установить prior на модели для Logit Adjustment (Menon ICLR 2021).
+
+        Активно только если у модели есть метод ``set_logit_prior``
+        (iTransformer) и ``logit_adjust_tau > 0``. Бэквард-совместимо для
+        TimeXer/ConvLSTM, у которых нет этой инфраструктуры.
+        """
+        setter = getattr(self.model, "set_logit_prior", None)
+        if setter is None:
+            return
+        tau = float(getattr(self.model, "logit_adjust_tau", 0.0))
+        if tau <= 0.0:
+            return
+        setter(torch.from_numpy(p_up.astype(np.float32)))
+        logger.info(
+            "Logit-adjust prior set: P(UP)=%s, tau=%.3f",
+            np.round(p_up, 3).tolist(), tau,
+        )
+
     def _auto_tune_loss(self, y_train: np.ndarray) -> None:
         """Настройка loss-функции по статистике train-таргетов."""
         if y_train.size == 0:
             return
-        # T1.2: Huber-δ для regression — масштабируем под медиану |y|.
         if not self._is_classification and self.cfg.huber_delta_auto:
             delta = max(2.0 * float(np.median(np.abs(y_train))), 1e-4)
             self.loss_fn = nn.HuberLoss(reduction="mean", delta=delta)
             logger.info("Auto Huber-delta: %.5g (from train target scale)", delta)
             return
-        # Anti-collapse: per-horizon pos_weight = (1 - P(UP)) / P(UP).
-        # Без него BCE на дисбалансе классов сходится к константе ≈ prior
-        # ("prediction collapse"). Focal не трогаем — у него своя логика.
-        if self._is_classification and isinstance(self.loss_fn, WeightedBCEWithLogits):
-            p_up = np.clip(y_train.mean(axis=0), 0.05, 0.95)
-            pos_weight = (1.0 - p_up) / p_up
+        if not self._is_classification:
+            return
+        p_up, pos_weight = self._compute_pos_weight(y_train)
+        # Logit Adjustment первым делом — независим от типа loss'а.
+        self._set_logit_prior(p_up)
+        # pos_weight применяется только к WeightedBCE (legacy путь).
+        # ASL/Focal/Composite его не используют — у них свой механизм
+        # компенсации imbalance.
+        if isinstance(self.loss_fn, WeightedBCEWithLogits):
             pw_tensor = torch.tensor(pos_weight, dtype=torch.float32)
             self.loss_fn = WeightedBCEWithLogits(pos_weight=pw_tensor).to(self.device)
-            logger.info(
-                "Auto pos_weight per horizon: %s (from P(UP)=%s)",
-                np.round(pos_weight, 3).tolist(),
-                np.round(p_up, 3).tolist(),
-            )
 
     def _init_swa(self, ctx: _FitContext) -> None:
         if not self.cfg.use_swa:
@@ -324,19 +416,102 @@ class Trainer:
                 bar.set_postfix_str(f"loss={total / max(count, 1):.5f}")
         return total / max(count, 1)
 
-    def _compute_loss(
+    def _call_loss(
         self,
         preds: torch.Tensor,
         y: torch.Tensor,
         lr: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Унифицированный вызов loss с учётом сигнатуры (2 / 3 args)."""
+        """Унифицированный вызов loss с учётом разных сигнатур."""
         if isinstance(self.loss_fn, CompositeQuantLoss):
             return self.loss_fn(preds, y, lr)
         if self._is_classification:
-            # BCE / Focal: (logits, target, weights). Передаём None.
             return self.loss_fn(preds, y, None)
         return self.loss_fn(preds, y)
+
+    def _compute_loss(
+        self,
+        preds: torch.Tensor,
+        y: torch.Tensor,
+        lr: torch.Tensor | None,
+        *,
+        x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Базовый loss + опциональная repulsion (D'Angelo NeurIPS 2021)."""
+        base = self._call_loss(preds, y, lr)
+        if x is None or not self._repulsion_predecessors or self._repulsion_weight <= 0:
+            return base
+        return base + functional_rbf_repulsion(
+            preds, x,
+            self._repulsion_predecessors,
+            weight=self._repulsion_weight,
+        )
+
+    def _maybe_mixup(
+        self,
+        x: torch.Tensor, y: torch.Tensor, lr: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Применить Mixup (Sprint B2) если включён в cfg и train-режим."""
+        alpha = float(getattr(self.cfg, "mixup_alpha", 0.0))
+        p = float(getattr(self.cfg, "mixup_p", 0.0))
+        if alpha <= 0 or p <= 0:
+            return x, y, lr
+        x_mix, y_mix, lr_mix, _ = maybe_apply_mixup(
+            x, y, lr, alpha=alpha, p=p,
+        )
+        return x_mix, y_mix, lr_mix
+
+    def _eval_step(
+        self,
+        x: torch.Tensor, y: torch.Tensor, lr: torch.Tensor | None,
+    ) -> float:
+        """Forward без backward — для val-эпохи. Repulsion в val не считаем."""
+        with torch.no_grad():
+            preds = self.model(x)
+            loss = self._compute_loss(preds, y, lr)  # без x → без repulsion
+        return float(loss.item())
+
+    def _train_step_plain(
+        self,
+        x: torch.Tensor, y: torch.Tensor, lr: torch.Tensor | None,
+    ) -> float:
+        """Обычный train-шаг (без ImbSAM)."""
+        self.optimizer.zero_grad(set_to_none=True)
+        preds = self.model(x)
+        loss = self._compute_loss(preds, y, lr, x=x)
+        loss.backward()
+        if self.cfg.grad_clip > 0:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
+        self.optimizer.step()
+        return float(loss.item())
+
+    def _train_step_imbsam(
+        self,
+        x: torch.Tensor, y: torch.Tensor, lr: torch.Tensor | None,
+    ) -> float:
+        """ImbSAM-шаг (B1): perturbation на minority-сэмплах + full-batch backward."""
+        h_idx = int(getattr(self.cfg, "imbsam_horizon_index", 0))
+        x_min, y_min, sub = select_minority_subset(
+            x, y, horizon_for_filter=h_idx,
+            extras={"lr": lr} if lr is not None else None,
+        )
+        lr_min = sub.get("lr") if sub else None
+
+        def loss_fn() -> torch.Tensor:
+            return self._compute_loss(self.model(x), y, lr, x=x)
+
+        def minority_loss_fn() -> torch.Tensor | None:
+            if x_min.shape[0] == 0:
+                return None
+            # Repulsion на minority-подмножестве тоже считаем — это
+            # последовательно с поведением full-batch шага.
+            return self._compute_loss(self.model(x_min), y_min, lr_min, x=x_min)
+
+        return self._imbsam.step(
+            loss_fn=loss_fn,
+            minority_loss_fn=minority_loss_fn,
+            grad_clip=self.cfg.grad_clip,
+        )
 
     def _step(
         self,
@@ -350,16 +525,13 @@ class Trainer:
         y = y.to(self.device)
         if lr is not None:
             lr = lr.to(self.device)
-        with torch.set_grad_enabled(train):
-            preds = self.model(x)
-            loss = self._compute_loss(preds, y, lr)
-            if train:
-                self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                if self.cfg.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-                self.optimizer.step()
-        return float(loss.item())
+        if not train:
+            return self._eval_step(x, y, lr)
+        # Train: опциональный mixup, затем либо ImbSAM, либо plain.
+        x, y, lr = self._maybe_mixup(x, y, lr)
+        if self._imbsam is not None:
+            return self._train_step_imbsam(x, y, lr)
+        return self._train_step_plain(x, y, lr)
 
 
 @dataclass

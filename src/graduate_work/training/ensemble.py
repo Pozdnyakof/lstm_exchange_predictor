@@ -4,24 +4,27 @@ Lakshminarayanan, Pritzel, Blundell (2017),
 *Simple and Scalable Predictive Uncertainty Estimation Using Deep Ensembles*
 [arXiv:1612.01474](https://arxiv.org/abs/1612.01474).
 
-Заменяет MC Dropout как источник эпистемической неопределённости. На
-финансовых задачах daily/intraday эмпирически даёт лучшую калибровку,
-особенно при class imbalance и distribution shift между train и test.
+**Repulsive Deep Ensembles** (D'Angelo & Fortuin, **NeurIPS 2021**,
+[arXiv:2106.11642](https://arxiv.org/abs/2106.11642)) — модификация:
+после R-0050 collapse-эпизода обнаружено, что независимые сиды
+сходятся к одному и тому же минимуму при сильном class imbalance
+(epistemic_std≈0.003 — эффективно один член ансамбля). Решение —
+явная функционально-пространственная репульсия: каждый новый член
+тренируется с штрафом `weight · mean RBF kernel(predictions, prev_members)`,
+что заставляет его уйти в другую функциональную область.
 
-Идея:
-- Обучаем M моделей на одних и тех же данных, но с разной инициализацией
-  (разные seeds + разный shuffling). Каждая сходится к своему локальному
-  минимуму.
-- На инференсе усредняем предсказания всех моделей и считаем std по
-  моделям как эпистемическую неопределённость.
-- Если внутри каждой модели ещё используется MC Dropout — получаем
-  дополнительную aleatoric-составляющую (но это опционально).
+Реализация — sequential repulsive: тренируем член 0 как обычно, член 1
+с repulsion от 0, член 2 от 0+1, и т.д. Это аппроксимация simultaneous
+SVGD-update'а (D'Angelo §4.2), но без ×M-памяти на одновременное
+обучение всех моделей.
 
 Использование::
 
-    ens = DeepEnsembleTrainer(model_factory, training_cfg, ensemble_size=5)
-    ens.fit(train_arrays, val_arrays, checkpoint_dir=...)
-    mean, std = ens.predict(test_arrays['x'])  # std — эпистемическая
+    ens = DeepEnsembleTrainer(
+        model_factory, training_cfg, ensemble_size=5,
+        repulsion_weight=0.1,
+    )
+    ens.fit(train_arrays, val_arrays, ...)
 
 Контракт ``model_factory(seed: int) -> nn.Module``: фабрика-замыкание,
 возвращающая свежую (необученную) сеть для данного seed.
@@ -84,11 +87,22 @@ class DeepEnsembleTrainer:
         trading_cfg: TradingConfig | None = None,
         device: str | None = None,
         base_seed: int | None = None,
+        repulsion_weight: float = 0.0,
     ) -> None:
+        """Конструктор.
+
+        ``repulsion_weight`` (D'Angelo NeurIPS 2021): ненулевое значение
+        включает sequential function-space repulsion — каждый член начиная
+        со 2-го получает RBF-штраф за схождение предсказаний с уже
+        обученными frozen-предшественниками. Рекомендуется 0.1-0.5.
+        """
         if ensemble_size < 2:
             msg = (
                 f"ensemble_size must be >= 2 for meaningful UQ, got {ensemble_size}"
             )
+            raise ValueError(msg)
+        if repulsion_weight < 0:
+            msg = f"repulsion_weight must be >= 0, got {repulsion_weight}"
             raise ValueError(msg)
         self.model_factory = model_factory
         self.training_cfg = training_cfg
@@ -99,6 +113,7 @@ class DeepEnsembleTrainer:
         self.base_seed = (
             int(base_seed) if base_seed is not None else int(training_cfg.seed)
         )
+        self.repulsion_weight = float(repulsion_weight)
         # Список обученных моделей (in-memory) — заполняется в fit().
         self.members: list[nn.Module] = []
 
@@ -123,17 +138,23 @@ class DeepEnsembleTrainer:
         for i in range(self.ensemble_size):
             seed = self.base_seed + i
             logger.info(
-                "=== Training ensemble member %d/%d (seed=%d) ===",
+                "=== Training ensemble member %d/%d (seed=%d, "
+                "repulsion_predecessors=%d, weight=%.3f) ===",
                 i + 1, self.ensemble_size, seed,
+                len(self.members), self.repulsion_weight,
             )
             set_seed(seed)
             model = self.model_factory(seed)
+            # Repulsive ensemble: i-й член отталкивается от уже обученных
+            # 0..i-1 frozen-моделей в self.members. Член 0 без репульсии.
             trainer = Trainer(
                 model,
                 self.training_cfg,
                 data_cfg=self.data_cfg,
                 trading_cfg=self.trading_cfg,
                 device=self.device,
+                repulsion_predecessors=list(self.members) if self.members else None,
+                repulsion_weight=self.repulsion_weight if self.members else 0.0,
             )
             ckpt = (
                 checkpoint_dir / f"member_{i:02d}_seed{seed}.pt"
@@ -144,7 +165,11 @@ class DeepEnsembleTrainer:
                 checkpoint_path=ckpt,
                 train_lr=train_lr, val_lr=val_lr,
             )
-            self.members.append(trainer.model.eval())
+            # Замораживаем обученного члена для будущих репульсий.
+            trained = trainer.model.eval()
+            for p in trained.parameters():
+                p.requires_grad = False
+            self.members.append(trained)
             history.member_histories.append(member_history)
             history.seeds.append(seed)
             if ckpt is not None:

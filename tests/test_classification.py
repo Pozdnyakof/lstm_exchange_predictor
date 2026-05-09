@@ -166,15 +166,14 @@ def test_trainer_classification_runs_and_outputs_logits() -> None:
     assert logits.shape == (n_val, h)
 
 
-def test_trainer_auto_pos_weight_for_imbalanced_classification() -> None:
-    """Anti-collapse: BCE должен получить per-horizon pos_weight = (1-p)/p."""
+def test_trainer_auto_pos_weight_legacy_formula() -> None:
+    """Legacy ветка: BCE получает per-horizon pos_weight = (1-p)/p,
+    когда ``use_class_balanced_pos_weight=False``."""
     set_seed(0)
     rng = np.random.default_rng(0)
     n_train, n_val = 200, 50
     t, f, h = 8, 4, 2
     x_tr = rng.standard_normal((n_train, t, f)).astype(np.float32)
-    # h=0: P(UP)=0.20  ->  pos_weight ≈ 4.0
-    # h=1: P(UP)=0.50  ->  pos_weight ≈ 1.0
     y_tr = np.zeros((n_train, h), dtype=np.float32)
     y_tr[:40, 0] = 1.0   # 20% positives для горизонта 0
     y_tr[:100, 1] = 1.0  # 50% positives для горизонта 1
@@ -191,7 +190,10 @@ def test_trainer_auto_pos_weight_for_imbalanced_classification() -> None:
         batch_size=32, epochs=1, learning_rate=1e-3,
         early_stopping_patience=10, use_swa=False, scheduler="none",
     )
-    trading_cfg = TradingConfig(loss_objective="bce")
+    # ВАЖНО: явно отключаем class-balanced ради проверки legacy-формулы.
+    trading_cfg = TradingConfig(
+        loss_objective="bce", use_class_balanced_pos_weight=False,
+    )
     trainer = Trainer(
         model, train_cfg,
         data_cfg=data_cfg, trading_cfg=trading_cfg,
@@ -206,6 +208,50 @@ def test_trainer_auto_pos_weight_for_imbalanced_classification() -> None:
     # h=1: (1-0.5)/0.5 = 1.0
     assert pw[0].item() == pytest.approx(4.0, rel=0.05)
     assert pw[1].item() == pytest.approx(1.0, rel=0.05)
+
+
+def test_trainer_class_balanced_pos_weight_default() -> None:
+    """Default ветка после R-0050: ``use_class_balanced_pos_weight=True``
+    даёт более мягкое значение pos_weight, чем (1-p)/p."""
+    set_seed(0)
+    rng = np.random.default_rng(0)
+    n_train, n_val = 1000, 100
+    t, f, h = 8, 4, 2
+    x_tr = rng.standard_normal((n_train, t, f)).astype(np.float32)
+    y_tr = np.zeros((n_train, h), dtype=np.float32)
+    y_tr[:200, 0] = 1.0   # 20% positives для h=0
+    y_tr[:500, 1] = 1.0   # 50% positives для h=1
+    x_va = rng.standard_normal((n_val, t, f)).astype(np.float32)
+    y_va = np.zeros((n_val, h), dtype=np.float32)
+
+    model_cfg = ModelConfig(
+        conv_channels=4, conv_kernel=3, lstm_hidden=4, lstm_layers=1,
+        fc_hidden=4, dropout=0.0, use_revin=False,
+    )
+    model = ConvLstmRegressor(input_dim=f, num_horizons=h, cfg=model_cfg)
+    trainer = Trainer(
+        model,
+        TrainingConfig(
+            batch_size=32, epochs=1, learning_rate=1e-3,
+            use_swa=False, scheduler="none",
+        ),
+        data_cfg=DataConfig(mode="classification"),
+        trading_cfg=TradingConfig(
+            loss_objective="bce",
+            use_class_balanced_pos_weight=True, class_balanced_beta=0.999,
+        ),
+        device="cpu",
+    )
+    trainer.fit({"x": x_tr, "y": y_tr}, {"x": x_va, "y": y_va})
+
+    pw = trainer.loss_fn.pos_weight
+    assert pw is not None
+    # h=0 (P=0.2): legacy =4.0; class-balanced при n=1000, β=0.999 → ~3.0–3.7
+    # — определённо МЕНЬШЕ legacy 4.0 (что и нужно — предотвращаем
+    # агрессивное усиление minority-класса).
+    assert pw[0].item() < 4.0
+    # h=1 (P=0.5): обе формулы дают ~1.0.
+    assert pw[1].item() == pytest.approx(1.0, rel=0.10)
 
 
 def test_weighted_bce_pos_weight_pushes_logits_up_for_minority_class() -> None:

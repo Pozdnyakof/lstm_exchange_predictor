@@ -195,16 +195,27 @@ class ModelConfig:
     # === iTransformer (architecture="itransformer") ===
     # Liu et al., ICLR 2024 (arXiv:2310.06625). Inverted attention:
     # каждая variate (фича) — один токен d_model. Self-attention идёт
-    # ПО КАНАЛАМ, что явно моделирует межканальные зависимости —
-    # критично для микроструктурных фич (OFI, спрэд, imbalance сильно
-    # скоррелированы). Дефолты подобраны под input_dim≈80 каналов:
-    # d_model=128 даёт ~10K параметров на attention layer.
+    # ПО КАНАЛАМ, что явно моделирует межканальные зависимости.
+    # Дефолты сильно ужаты после R-0050 collapse-эпизода (см. отчёт):
+    # d=64, layers=2 — устраняют overfitting (train/val gap 0.30→<0.05)
+    # на 489k samples × 53 features.
     itransformer_seq_len: int = 384
-    itransformer_d_model: int = 128
-    itransformer_n_layers: int = 3
+    itransformer_d_model: int = 64
+    itransformer_n_layers: int = 2
     itransformer_n_heads: int = 8
-    itransformer_d_ff: int = 256
+    itransformer_d_ff: int = 128
     itransformer_dropout: float = 0.3
+    # Stochastic Depth (Huang et al., ECCV 2016): drop_path=0.2 →
+    # каждый residual-блок отключается с p=0.2 на тренировке.
+    itransformer_drop_path: float = 0.2
+
+    # === Logit Adjustment (Menon et al., ICLR 2021, arXiv:2007.07314) ===
+    # Для бинарного BCE с class imbalance: на тренировке logits[h] -=
+    # tau · logit(P_train(UP, h)). Смещает оптимум BCE с prior'а в
+    # информативную область, доказанно решает predict-the-prior collapse.
+    # 0.0 = выключено; 1.0 — рекомендация Menon (Bayes-optimal balanced
+    # error). Применяется только если ``mode='classification'``.
+    logit_adjust_tau: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -244,6 +255,28 @@ class TrainingConfig:
     # T2.2: AdamW + CosineAnnealing вместо плоского Adam.
     optimizer: str = "adamw"  # adam | adamw
     scheduler: str = "cosine"  # none | cosine
+    # === ImbSAM (Zhou et al., ICCV 2023) ===
+    # Sharpness-Aware Minimization применённый только к minority-class.
+    # Сокращает train/val gap при class imbalance через регуляризацию на
+    # «плоский» минимум именно на minority-сэмплах (Foret ICLR 2021).
+    use_imbsam: bool = False
+    imbsam_rho: float = 0.05
+    # Горизонт-фильтр для определения minority-сэмплов (индекс в horizons).
+    # 0 = самый разбалансированный (h=6 при P(UP)=0.29 в R-0050).
+    imbsam_horizon_index: int = 0
+    # === Mixup (Zhang et al., ICLR 2018) ===
+    # β-distribution параметр; 0.0 = выключен. 0.2 — рекомендация
+    # Amazon Science 2024 для TS-forecasting.
+    mixup_alpha: float = 0.2
+    # Вероятность применения mixup к батчу. 0.5 = на каждом 2-м батче
+    # — даёт регуляризацию, но оставляет «чистые» примеры.
+    mixup_p: float = 0.5
+    # === Repulsive Deep Ensembles (D'Angelo NeurIPS 2021) ===
+    # Function-space repulsion между членами Deep Ensemble. λ=0 →
+    # обычный non-repulsive ensemble. 0.1-0.5 — рекомендуемый диапазон.
+    # Каждый i-й член (i≥1) получает штраф за RBF-схождение
+    # предсказаний с frozen-предшественниками 0..i-1.
+    ensemble_repulsion_weight: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -278,20 +311,41 @@ class TradingConfig:
     selection_correction: str = "sidak"
 
     # === LOSS ===
-    # "bce"       — обычный binary cross-entropy (дефолт для классификации)
-    # "focal"     — focal-loss; полезен при дисбалансе классов
-    # "composite" — α·BCE + β·RankIC + γ·Sharpe + δ·Monotone (quant-loss)
+    # "bce"       — обычный binary cross-entropy (legacy)
+    # "focal"     — focal-loss
+    # "asl"       — Asymmetric Loss (Ridnik-Ben-Baruch ICCV 2021), SOTA
+    #               на extreme negative dominance; рекомендация после R-0050
+    # "composite" — InnerCls + RankIC + Sharpe + Monotone (quant-loss)
     loss_objective: str = "bce"
     focal_gamma: float = 2.0
     focal_alpha: float = 0.25
-    # Веса композитного quant-loss'а. RankIC оптимизирует cross-sectional
-    # ranking (Microsoft Qlib); Sharpe прямо оптимизирует risk-adjusted
-    # PnL (Lim-Zohren-Roberts 2019); monotone штрафует немонотонность
-    # вероятностей по горизонтам. BCE удерживает калибровку.
+    # === ASL params (Ridnik & Ben-Baruch, ICCV 2021, arXiv:2009.14119) ===
+    asl_gamma_pos: float = 0.0
+    asl_gamma_neg: float = 4.0
+    asl_clip: float = 0.05
+    # === Class-Balanced pos_weight (Cui et al., CVPR 2019) ===
+    # Если True — pos_weight вычисляется как (1-β)/(1-β^n_class), β=0.999.
+    # Иначе — старый (1-P)/P (агрессивно усиливает minority и провоцирует
+    # collapse при P(UP)~0.3 и большом n).
+    use_class_balanced_pos_weight: bool = True
+    class_balanced_beta: float = 0.999
+    # === Composite quant-loss ===
+    # Sharpe выключен по умолчанию (после R-0050): scale-invariant Sharpe
+    # на коллапсированной модели тождественно 0, не даёт градиента.
+    # Включать только когда RankIC/InnerCls уже работают и output-range
+    # модели устойчиво > 0.15.
     composite_bce_weight: float = 1.0
     composite_rankic_weight: float = 0.5
-    composite_sharpe_weight: float = 0.3
+    composite_sharpe_weight: float = 0.0
     composite_monotone_weight: float = 0.1
+    # Inner classification head для composite: 'bce' | 'focal' | 'asl'.
+    # 'asl' по умолчанию — устраняет совпадение minimum'ов всех 4 компонент
+    # на константе prior (главная причина collapse в R-0050).
+    composite_inner_loss: str = "asl"
+    # Uncertainty Weighting (Kendall CVPR 2018): автоматически балансирует
+    # разномасштабные компоненты через обучаемый log_var. Заменяет
+    # ручной подбор weights.
+    composite_uncertainty_weighting: bool = False
     # Случайные портфели:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0

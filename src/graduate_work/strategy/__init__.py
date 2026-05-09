@@ -3,6 +3,7 @@
 from .adaptive_conformal import (
     ACIState,
     AdaptiveConformalPredictor,
+    DtACIPredictor,
     aci_signals_to_actions,
 )
 from .calibration import (
@@ -31,6 +32,7 @@ __all__ = [
     "ConformalCalibration",
     "ConformalSignalGenerator",
     "ConsensusThresholds",
+    "DtACIPredictor",
     "SignalGenerator",
     "aci_signals_to_actions",
     "apply_consensus_thresholds",
