@@ -170,6 +170,30 @@ class AlgopackClient:
         msg = f"ALGOPACK {url} failed after {self.retries} retries"
         raise AlgopackError(msg) from last_exc
 
+    def _iter_pages(self, path: str, base_params: dict):
+        """Generator: yields (columns, data_rows) на каждой странице.
+
+        Останавливается ТОЛЬКО на пустой странице — ALGOPACK имеет
+        server-side hard cap ~1000 строк, поэтому проверка
+        ``len(page) < page_size`` здесь не работает (всегда true на
+        первой же странице, теряем 90%+ данных).
+        """
+        cursor = 0
+        while True:
+            payload = self._fetch_one_page(
+                path, {**base_params, "start": cursor},
+            )
+            block = _extract_data_block(payload)
+            if block is None:
+                return
+            page = block.get("data", [])
+            cols = block.get("columns", [])
+            if not page:
+                return
+            yield cols, page
+            cursor += len(page)
+            time.sleep(self.request_pause)
+
     def _paginate(
         self,
         path: str,
@@ -178,25 +202,13 @@ class AlgopackClient:
         page_size: int,
     ) -> pd.DataFrame:
         """Скачать все страницы endpoint-а и склеить в один DataFrame."""
+        base_params = {**params, "limit": page_size}
         rows: list[list] = []
         columns: list[str] | None = None
-        cursor = 0
-        while True:
-            payload = self._fetch_one_page(path, {**params, "start": cursor})
-            block = _extract_data_block(payload)
-            if block is None:
-                break
-            page_cols = block.get("columns", [])
-            page = block.get("data", [])
+        for cols, page in self._iter_pages(path, base_params):
             if columns is None:
-                columns = list(page_cols)
-            if not page:
-                break
+                columns = list(cols)
             rows.extend(page)
-            if len(page) < page_size:
-                break
-            cursor += len(page)
-            time.sleep(self.request_pause)
         if not rows or columns is None:
             return pd.DataFrame(columns=columns or [])
         return pd.DataFrame(rows, columns=columns)

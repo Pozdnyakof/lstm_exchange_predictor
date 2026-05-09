@@ -107,6 +107,23 @@ def test_paginate_returns_empty_when_no_data() -> None:
     assert df.empty
 
 
+def test_paginate_forces_limit_param() -> None:
+    """ALGOPACK по умолчанию отдаёт мало строк/страница — мы должны
+    форсить limit=page_size, иначе пагинация прерывается на первой странице."""
+    client = AlgopackClient(token="x")
+    captured_params: list[dict] = []
+
+    def fake_fetch(path, params):
+        captured_params.append(params.copy())
+        return {"tradestats": {"columns": ["a"], "data": []}}
+
+    client._fetch_one_page = MagicMock(side_effect=fake_fetch)
+    client._paginate("path", {"from": "2024-01-01"}, page_size=10000)
+    assert captured_params, "должен быть хотя бы один запрос"
+    assert captured_params[0].get("limit") == 10000
+    assert captured_params[0].get("from") == "2024-01-01"
+
+
 # ---------------------------------------------------------------------------
 # Errors: 401 raises AlgopackError immediately
 # ---------------------------------------------------------------------------
