@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import lightgbm as lgb
 import numpy as np
@@ -347,6 +348,70 @@ class MetaLabelingPipeline:
         # Replace ticker column (lost in reset_index)
         meta_preds = self.meta.predict(df_with_primary)
         return primary_preds, meta_preds
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, output_dir: Path) -> None:
+        """Сохранить Primary + Meta + конфиг в одну директорию.
+
+        Layout::
+
+            output_dir/
+              primary/   ← LightGBMPipeline.save()
+              meta/      ← LightGBMPipeline.save()
+              meta_labeling.json   ← features, cost_per_trade, etc
+        """
+        import json
+
+        if self.primary is None or self.meta is None:
+            msg = "fit() not called yet — nothing to save"
+            raise RuntimeError(msg)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self.primary.save(output_dir / "primary")
+        self.meta.save(output_dir / "meta")
+        manifest = {
+            "horizons": list(self.horizons),
+            "primary_features": list(self.primary_features),
+            "meta_features": list(self.meta_features),
+            "cost_per_trade": float(self.cost_per_trade),
+            "profit_multiplier": float(self.profit_multiplier),
+            "n_oof_splits": int(self.n_oof_splits),
+        }
+        (output_dir / "meta_labeling.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        logger.info("Saved MetaLabelingPipeline to %s", output_dir)
+
+    @classmethod
+    def load(cls, output_dir: Path) -> "MetaLabelingPipeline":
+        """Восстановить pipeline из директории, созданной :meth:`save`.
+
+        Configs LightGBM не сохраняются отдельно — они нужны только для
+        обучения, в восстановленном пайплайне используются default'ы.
+        """
+        import json
+
+        manifest = json.loads(
+            (output_dir / "meta_labeling.json").read_text(encoding="utf-8"),
+        )
+        primary = LightGBMPipeline.load(output_dir / "primary")
+        meta = LightGBMPipeline.load(output_dir / "meta")
+        pipeline = cls(
+            horizons=tuple(manifest["horizons"]),
+            primary_features=list(manifest["primary_features"]),
+            meta_features=list(manifest["meta_features"]),
+            primary_cfg=LightGBMConfig(),
+            meta_cfg=LightGBMConfig(),
+            cost_per_trade=float(manifest["cost_per_trade"]),
+            profit_multiplier=float(manifest["profit_multiplier"]),
+            n_oof_splits=int(manifest["n_oof_splits"]),
+        )
+        pipeline.primary = primary
+        pipeline.meta = meta
+        return pipeline
 
 
 def _merge_primary_meta_lr(

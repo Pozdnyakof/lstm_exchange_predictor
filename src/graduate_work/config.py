@@ -367,6 +367,47 @@ class TradingConfig:
     n_random_portfolios: int = 1000
     sigma_threshold: float = 3.0
 
+    # === POSITION SIZING ===
+    # Режим расчёта объёма позиции при входе:
+    # - "equal_split"  — старое поведение: cash / free_slots (≈20% при
+    #                    max_positions=5). Полностью аллоцирует капитал.
+    # - "fixed_frac"   — фиксированная доля initial_capital на каждый вход
+    #                    (см. ``position_size_fraction``). Обычно 5–10%.
+    # - "signal_kelly" — sizing пропорционален «edge» сигнала
+    #                    (см. ``model.kelly_sizing.signal_kelly_size``);
+    #                    fraction ≈ kelly_scale * edge, ограничен
+    #                    [0, max_position_size_fraction].
+    sizing_mode: str = "equal_split"
+    # Доля initial_capital на одну сделку для sizing_mode="fixed_frac".
+    # 0.10 = 10% капитала на трейд → можно держать ~10 позиций; снижает
+    # дисперсию equity по сравнению с 20% (equal_split при max_positions=5).
+    position_size_fraction: float = 0.10
+    # Жёсткий cap на размер ОДНОЙ позиции (для всех sizing_mode).
+    # Не позволяет Kelly-сайзингу взорваться при сильно перекошенном
+    # сигнале: даже если edge огромный, не более ``X * initial_capital``.
+    # 1.0 = без cap'а (поведение legacy equal_split, где «бюджет = весь cash
+    # делится между свободными слотами»). Ставьте 0.10–0.20 если нужен
+    # риск-лимит при fixed_frac/signal_kelly.
+    max_position_size_fraction: float = 1.0
+    # === EXIT TRIGGERS (intra-bar, на основе high/low внутри бара) ===
+    # 0.0 = выключено; >0 = доля entry_price для закрытия раньше horizon.
+    # Применяются только если в prices есть колонки ``high``/``low``.
+    # Приоритет внутри бара: stop_loss > profit_target > horizon-exit.
+    # Stop срабатывает если low <= entry * (1 - stop_loss_pct);
+    # target — если high >= entry * (1 + profit_target_pct).
+    stop_loss_pct: float = 0.0
+    profit_target_pct: float = 0.0
+    # === KELLY SIZING ===
+    # Параметры для sizing_mode="signal_kelly". edge приблизительно
+    # пропорционален (primary - 0.5)·(meta - 0.5); kelly_scale переводит
+    # safe «fractional Kelly» (обычно 0.25–0.5 от full Kelly).
+    kelly_scale: float = 0.5
+    # Базовый «безопасный» порог Primary, ниже которого edge=0
+    # (edge = max(primary - kelly_primary_floor, 0)).
+    kelly_primary_floor: float = 0.50
+    # То же для Meta (если meta-сигнал доступен; иначе игнорируется).
+    kelly_meta_floor: float = 0.50
+
 
 @dataclass(frozen=True)
 class ServingConfig:

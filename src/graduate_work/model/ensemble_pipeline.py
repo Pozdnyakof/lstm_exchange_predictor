@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import lightgbm as lgb
@@ -340,6 +341,103 @@ class EnsemblePipeline:
                     block[col] = df[col].to_numpy()
             rows.append(block)
         return pd.concat(rows, ignore_index=True)
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, output_dir: Path) -> None:
+        """Сохранить все per-horizon ensembles через pickle + manifest.
+
+        Каждая base-модель пиклится отдельно: ``ens_h{h}_m{i}_{type}.pkl``.
+        Манифест хранит порядок и тип каждой базы — после load() мы должны
+        ВОССТАНОВИТЬ predict_proba над теми же фичами в том же порядке.
+
+        SECURITY: pickle небезопасен на untrusted данных. Применять
+        только к собственным чекпоинтам.
+        """
+        import json
+        import pickle
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        models_meta: list[dict[str, Any]] = []
+        for h, result in sorted(self.models.items()):
+            base_files: list[str] = []
+            for i, (model, mtype) in enumerate(
+                zip(result.base_models, result.base_types, strict=True),
+            ):
+                fname = f"ens_h{h}_m{i}_{mtype}.pkl"
+                with (output_dir / fname).open("wb") as f:
+                    pickle.dump(model, f)
+                base_files.append(fname)
+            models_meta.append({
+                "horizon": int(h),
+                "base_files": base_files,
+                "base_types": list(result.base_types),
+                "val_log_loss": float(result.val_log_loss),
+                "val_auc": (
+                    None if result.val_auc is None else float(result.val_auc)
+                ),
+            })
+        manifest = {
+            "horizons": list(self.horizons),
+            "feature_cols": list(self.feature_cols),
+            "base_configs": [
+                {
+                    "model_type": cfg.model_type,
+                    "params": cfg.params,
+                    "early_stopping_rounds": cfg.early_stopping_rounds,
+                }
+                for cfg in self.base_configs
+            ],
+            "models": models_meta,
+        }
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        logger.info("Saved EnsemblePipeline to %s", output_dir)
+
+    @classmethod
+    def load(cls, output_dir: Path) -> "EnsemblePipeline":
+        """Восстановить pipeline из директории, созданной :meth:`save`."""
+        import json
+        import pickle
+
+        manifest = json.loads(
+            (output_dir / "manifest.json").read_text(encoding="utf-8"),
+        )
+        base_configs = [
+            BaseModelConfig(
+                model_type=str(c["model_type"]),
+                params=dict(c.get("params", {})),
+                early_stopping_rounds=int(c.get("early_stopping_rounds", 30)),
+            )
+            for c in manifest.get("base_configs", [])
+        ]
+        pipeline = cls(
+            horizons=tuple(manifest["horizons"]),
+            feature_cols=list(manifest["feature_cols"]),
+            base_configs=base_configs,
+        )
+        for entry in manifest["models"]:
+            base_models = []
+            for fname in entry["base_files"]:
+                with (output_dir / fname).open("rb") as f:
+                    base_models.append(pickle.load(f))  # noqa: S301 — own checkpoint
+            h = int(entry["horizon"])
+            pipeline.models[h] = EnsembleHorizonResult(
+                horizon=h,
+                base_models=base_models,
+                base_types=list(entry["base_types"]),
+                feature_cols=list(manifest["feature_cols"]),
+                val_log_loss=float(entry["val_log_loss"]),
+                val_auc=(
+                    None if entry.get("val_auc") is None
+                    else float(entry["val_auc"])
+                ),
+            )
+        return pipeline
 
 
 __all__ = [
