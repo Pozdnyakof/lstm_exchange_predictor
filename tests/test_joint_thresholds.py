@@ -101,6 +101,71 @@ def test_joint_empty_data_returns_safe() -> None:
     assert sweep == []
 
 
+def test_primary_percentiles_uses_distribution() -> None:
+    """primary_percentiles=(20.0,) → T_prim равен 80-му перцентилю val-primary."""
+    val_p, val_m, val_lr = _make_val_data(n=500)
+    T_prim, _, sweep = joint_max_pnl_thresholds(
+        val_p, val_m, val_lr, horizon=6,
+        primary_percentiles=(20.0,),
+        meta_percentiles=(50.0,),
+        cost_per_trade=0.001, min_trades=10,
+    )
+    expected_T_prim = float(np.percentile(val_p["mean"], 80.0))
+    # Sweep содержит ровно одну точку, и её T_prim это и есть expected
+    assert len(sweep) == 1
+    assert abs(sweep[0]["T_prim"] - expected_T_prim) < 1e-9
+    assert abs(T_prim - expected_T_prim) < 1e-9
+    assert sweep[0]["primary_pct"] == 20.0
+
+
+def test_primary_percentiles_overrides_thresholds() -> None:
+    """Если primary_percentiles задан, абсолютные primary_thresholds игнорятся."""
+    val_p, val_m, val_lr = _make_val_data(n=300)
+    _, _, sweep = joint_max_pnl_thresholds(
+        val_p, val_m, val_lr, horizon=6,
+        primary_thresholds=(0.99,),  # бы дал 0 trades
+        primary_percentiles=(50.0,),  # 50-й перцентиль гарантирует половину наблюдений
+        meta_percentiles=(50.0,),
+        cost_per_trade=0.001, min_trades=10,
+    )
+    # primary_thresholds полностью игнорируется → T_prim из distribution.
+    expected = float(np.percentile(val_p["mean"], 50.0))
+    assert abs(sweep[0]["T_prim"] - expected) < 1e-9
+    # n_trades нетривиальный (не 0).
+    assert sweep[0]["n_trades"] > 10
+
+
+def test_primary_percentiles_avoids_edge_effect() -> None:
+    """Узкое primary-распределение → percentile стабильно даёт top-K сигналов."""
+    rng = np.random.default_rng(0)
+    n = 1000
+    timestamps = pd.date_range("2024-01-01", periods=n, freq="5min", tz="UTC")
+    # Узкое распределение [0.40, 0.55] — характерно для длинных горизонтов.
+    primaries = rng.uniform(0.40, 0.55, size=n)
+    val_p = pd.DataFrame({
+        "timestamp": timestamps, "ticker": "SBER", "horizon": 48,
+        "mean": primaries,
+    })
+    val_m = pd.DataFrame({
+        "timestamp": timestamps, "ticker": "SBER", "horizon": 48,
+        "mean": rng.uniform(0.30, 0.50, size=n),
+    })
+    val_lr = pd.DataFrame({
+        "timestamp": timestamps, "ticker": "SBER", "horizon": 48,
+        "actual": rng.standard_normal(n) * 0.005,
+    })
+    # Абсолютный T=0.55 даст 0 trades (max=0.55, > строго не выполнится).
+    # Percentile 10% (т.е. top-10) гарантирует ~100 наблюдений.
+    _, _, sweep_pct = joint_max_pnl_thresholds(
+        val_p, val_m, val_lr, horizon=48,
+        primary_percentiles=(10.0,),
+        meta_percentiles=(50.0,),
+        cost_per_trade=0.001, min_trades=20,
+    )
+    # n_trades должен быть в районе 50 (top-10% от ~1000 / разные пересечения)
+    assert sweep_pct[0]["n_trades"] >= 30
+
+
 def test_joint_horizon_filter_works() -> None:
     """Фильтр по horizon корректно отбирает только нужные строки."""
     n = 100

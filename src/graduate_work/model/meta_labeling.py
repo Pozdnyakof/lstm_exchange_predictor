@@ -459,6 +459,71 @@ def _evaluate_threshold_pair(
     }
 
 
+def _resolve_primary_grid(
+    merged: pd.DataFrame,
+    primary_thresholds: tuple[float, ...],
+    primary_percentiles: tuple[float, ...] | None,
+) -> list[tuple[float, float]]:
+    """Вернуть список (T_prim, prim_pct) для сетки primary-порогов.
+
+    Если ``primary_percentiles`` задан → percentile-based; ``prim_pct``
+    содержит pct. Иначе абсолютные пороги; ``prim_pct`` = NaN.
+    """
+    if primary_percentiles is not None:
+        return [
+            (float(np.percentile(merged["primary"], 100.0 - pct)), float(pct))
+            for pct in primary_percentiles
+        ]
+    return [(float(t), float("nan")) for t in primary_thresholds]
+
+
+def _first_T_prim_fallback(
+    merged: pd.DataFrame,
+    primary_thresholds: tuple[float, ...],
+    primary_percentiles: tuple[float, ...] | None,
+) -> float:
+    """Дефолтный T_prim, когда выбрать не из чего."""
+    if primary_percentiles is None:
+        return float(primary_thresholds[0])
+    if merged.empty:
+        return 0.5
+    return float(np.percentile(merged["primary"], 100.0 - primary_percentiles[0]))
+
+
+def _run_threshold_sweep(
+    merged: pd.DataFrame,
+    primary_grid: list[tuple[float, float]],
+    meta_percentiles: tuple[float, ...],
+    cost_per_trade: float,
+    min_trades: int,
+) -> tuple[list[dict], int | None, int | None]:
+    """Прокатить decart sweep, вернуть (sweep, best_idx, fallback_idx)."""
+    sweep: list[dict] = []
+    best_idx: int | None = None
+    best_pnl = -np.inf
+    fallback_idx: int | None = None
+    fallback_pnl = -np.inf
+    for T_prim, prim_pct in primary_grid:
+        for pct in meta_percentiles:
+            T_meta_abs = float(np.percentile(merged["meta"], 100.0 - pct))
+            row = _evaluate_threshold_pair(
+                merged, T_prim, T_meta_abs, pct, cost_per_trade,
+            )
+            row["primary_pct"] = prim_pct
+            sweep.append(row)
+            pnl = row["mean_pnl"]
+            if not np.isfinite(pnl):
+                continue
+            idx = len(sweep) - 1
+            if pnl > fallback_pnl:
+                fallback_pnl = pnl
+                fallback_idx = idx
+            if row["n_trades"] >= min_trades and pnl > best_pnl:
+                best_pnl = pnl
+                best_idx = idx
+    return sweep, best_idx, fallback_idx
+
+
 def joint_max_pnl_thresholds(
     val_primary: pd.DataFrame,
     val_meta: pd.DataFrame,
@@ -466,6 +531,7 @@ def joint_max_pnl_thresholds(
     horizon: int,
     *,
     primary_thresholds: tuple[float, ...] = (0.45, 0.50, 0.55, 0.60, 0.65),
+    primary_percentiles: tuple[float, ...] | None = None,
     meta_percentiles: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0),
     cost_per_trade: float = 0.001,
     min_trades: int = 50,
@@ -478,51 +544,45 @@ def joint_max_pnl_thresholds(
     «топ-10% самых уверенных meta-предсказаний», что **гарантирует**
     непустой n_buy на любом горизонте.
 
-    Возвращает (best_T_prim, best_T_meta_abs, sweep_table). T_meta_abs —
-    абсолютный порог, рассчитанный из val-meta-распределения.
+    **Sprint 2.5 fix**: на длинных горизонтах primary-распределение узкое
+    (h=48: max=0.56), и абсолютные пороги {0.45..0.65} либо берут весь
+    набор, либо вырезают edge-of-distribution с горсткой наблюдений
+    (например, T=0.55 → 18 из 514k). Это ломает out-of-sample поведение.
+    Поэтому добавлен **percentile-based primary**: ``primary_percentiles``
+    задаёт «топ-X% сигналов по primary», эквивалентно meta_percentiles и
+    устраняет edge-effect. Если задан — ``primary_thresholds`` игнорируется.
 
-    ``min_trades`` — минимальное число сделок на val для валидной точки.
-    Если нет ни одной комбинации с min_trades — fallback к лучшей по PnL.
+    Возвращает (best_T_prim, best_T_meta_abs, sweep_table). Каждый row
+    содержит ``primary_pct`` (NaN если использовался абсолютный порог).
     """
     merged = _merge_primary_meta_lr(
         val_primary, val_meta, val_lr_targets, horizon,
     )
     if merged.empty:
-        return float(primary_thresholds[0]), float("nan"), []
-
-    sweep: list[dict] = []
-    best_idx = None
-    best_pnl = -np.inf
-    fallback_idx = None
-    fallback_pnl = -np.inf
-    for T_prim in primary_thresholds:
-        for pct in meta_percentiles:
-            T_meta_abs = float(np.percentile(merged["meta"], 100.0 - pct))
-            row = _evaluate_threshold_pair(
-                merged, T_prim, T_meta_abs, pct, cost_per_trade,
-            )
-            sweep.append(row)
-            pnl = row["mean_pnl"]
-            if not np.isfinite(pnl):
-                continue
-            if pnl > fallback_pnl:
-                fallback_pnl = pnl
-                fallback_idx = len(sweep) - 1
-            if row["n_trades"] >= min_trades and pnl > best_pnl:
-                best_pnl = pnl
-                best_idx = len(sweep) - 1
-
-    if best_idx is None:
-        if fallback_idx is None:
-            return float(primary_thresholds[0]), float("nan"), sweep
-        chosen = sweep[fallback_idx]
-        logger.warning(
-            "joint_max_pnl: нет комбинаций >= %d trades, fallback к best PnL: "
-            "T_prim=%.3f, T_meta=%.3f",
-            min_trades, chosen["T_prim"], chosen["T_meta_abs"],
+        return (
+            _first_T_prim_fallback(merged, primary_thresholds, primary_percentiles),
+            float("nan"), [],
         )
+    primary_grid = _resolve_primary_grid(
+        merged, primary_thresholds, primary_percentiles,
+    )
+    sweep, best_idx, fallback_idx = _run_threshold_sweep(
+        merged, primary_grid, meta_percentiles, cost_per_trade, min_trades,
+    )
+    if best_idx is not None:
+        chosen = sweep[best_idx]
         return float(chosen["T_prim"]), float(chosen["T_meta_abs"]), sweep
-    chosen = sweep[best_idx]
+    if fallback_idx is None:
+        return (
+            _first_T_prim_fallback(merged, primary_thresholds, primary_percentiles),
+            float("nan"), sweep,
+        )
+    chosen = sweep[fallback_idx]
+    logger.warning(
+        "joint_max_pnl: нет комбинаций >= %d trades, fallback к best PnL: "
+        "T_prim=%.3f, T_meta=%.3f",
+        min_trades, chosen["T_prim"], chosen["T_meta_abs"],
+    )
     return float(chosen["T_prim"]), float(chosen["T_meta_abs"]), sweep
 
 
