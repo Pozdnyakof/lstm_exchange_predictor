@@ -1,0 +1,336 @@
+"""Meta-labeling: вторичный classifier поверх Primary для фильтрации сделок.
+
+Lopez de Prado, *Advances in Financial ML* (2018), глава 3.
+
+## Идея
+
+Primary (LightGBM на всех 90+ признаках) отвечает на вопрос:
+   "Цена пойдёт вверх или вниз?"
+
+Meta (отдельный classifier на ~10 признаках, включая Primary's prediction)
+отвечает на вопрос:
+   "Стоит ли действовать на этом конкретном сигнале Primary?"
+
+Meta получает на вход:
+   - Primary's prediction (как фичу)
+   - Контекст: волатильность, спред, режим (HI2), время суток
+И выдаёт probability того, что **трейд закроется в плюс**.
+
+Финальный сигнал: торгуем если Primary > T1 AND Meta > T2.
+
+## Зачем это работает
+
+- Primary имеет конфликт: BCE-loss минимизируется и при хорошем
+  ranking, и при выходе на prior. Meta развязывает эти задачи —
+  ранжирование остаётся за Primary, **бинарное решение** (trade/skip)
+  делает Meta.
+- Meta видит meta-target = "трейд был прибыльным" (бинарный),
+  что НЕ совпадает с Primary's target = "цена пошла вверх" (тоже
+  бинарный, но шире — включает не-прибыльные движения < cost).
+- Mета учится на ОШИБКАХ Primary: где Primary говорит "BUY", но
+  это плохая идея (низкая ликвидность, режим high-vol).
+
+## Pipeline
+
+1. **OOF Primary**: 5-fold TimeSeriesSplit на train → out-of-sample
+   primary predictions для всего train.
+2. **Final Primary**: обучается на полном train (для inference).
+3. **Meta train**: train_df + primary_h{h} (OOF) + meta_target_h{h}
+   (= 1 если lr > 2·cost, иначе 0).
+4. **Meta val**: val_df + primary predictions Final Primary + meta_target.
+5. **Meta**: LightGBM на meta features → predicts meta_target.
+6. **Inference**: Primary → Meta → final signal where Meta > threshold.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Callable
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import TimeSeriesSplit
+
+from .lgbm_pipeline import LightGBMConfig, LightGBMPipeline
+
+logger = logging.getLogger(__name__)
+
+
+def compute_lgbm_oof_per_horizon(
+    train_df: pd.DataFrame,
+    feature_cols: list[str],
+    horizons: tuple[int, ...],
+    *,
+    cfg: LightGBMConfig | None = None,
+    n_splits: int = 5,
+) -> pd.DataFrame:
+    """OOF predictions через TimeSeriesSplit. Возвращает DataFrame с
+    индексом train_df и колонками ``primary_h{h}`` per horizon.
+
+    TimeSeriesSplit обеспечивает строгую chronological-разбивку:
+    fold k обучается ТОЛЬКО на данных ДО fold k. Это важно для
+    финансов, где случайный shuffle даёт look-ahead через
+    автокорреляцию между близкими барами.
+
+    Первые ~1/(n_splits+1) баров остаются БЕЗ OOF (первый фолд
+    использует их для обучения, не для предсказания). Эти строки
+    получают NaN в выводе и должны фильтроваться вызывающей стороной.
+    """
+    if cfg is None:
+        cfg = LightGBMConfig()
+    out = pd.DataFrame(index=train_df.index)
+    for h in horizons:
+        out[f"primary_h{h}"] = np.nan
+
+    n = len(train_df)
+    tscv = TimeSeriesSplit(n_splits=n_splits)
+    for fold_idx, (tr_idx, te_idx) in enumerate(tscv.split(np.arange(n))):
+        tr_sub = train_df.iloc[tr_idx]
+        te_sub = train_df.iloc[te_idx]
+        for h in horizons:
+            target_col = f"target_h{h}"
+            if target_col not in tr_sub.columns:
+                continue
+            mask_tr = tr_sub[target_col].notna()
+            mask_te = te_sub[target_col].notna()
+            if not mask_tr.any() or not mask_te.any():
+                continue
+            X_tr = tr_sub.loc[mask_tr, feature_cols]
+            y_tr = tr_sub.loc[mask_tr, target_col].astype(int).to_numpy()
+            X_te = te_sub.loc[mask_te, feature_cols]
+            model = lgb.LGBMClassifier(**cfg.to_lgb_params())
+            model.fit(X_tr, y_tr)
+            preds = model.predict_proba(X_te)[:, 1]
+            preds_idx = te_sub.loc[mask_te].index
+            out.loc[preds_idx, f"primary_h{h}"] = preds.astype(np.float32)
+        logger.info(
+            "OOF fold %d/%d done (train=%d, test=%d)",
+            fold_idx + 1, n_splits, len(tr_sub), len(te_sub),
+        )
+    return out
+
+
+def build_meta_targets(
+    df: pd.DataFrame,
+    horizons: tuple[int, ...],
+    *,
+    cost_per_trade: float = 0.001,
+    profit_multiplier: float = 2.0,
+) -> pd.DataFrame:
+    """Добавить meta_target_h{h} колонки.
+
+    meta_target = 1 если ``lr_h{h} > profit_multiplier · cost_per_trade``.
+    Иначе 0. NaN там, где lr недоступен.
+
+    profit_multiplier=2 — заходим только если ожидаемый профит >= 2× costs
+    (margin of safety). Можно ужать до 1.0 для более «жадного» режима.
+    """
+    out = df.copy()
+    threshold = float(profit_multiplier * cost_per_trade)
+    for h in horizons:
+        lr_col = f"lr_h{h}"
+        meta_col = f"meta_target_h{h}"
+        if lr_col not in df.columns:
+            continue
+        lr = df[lr_col]
+        meta_target = (lr > threshold).astype(np.float32)
+        meta_target[lr.isna()] = np.nan
+        out[meta_col] = meta_target
+    return out
+
+
+def add_primary_predictions_wide(
+    df: pd.DataFrame,
+    primary_long: pd.DataFrame,
+    horizons: tuple[int, ...],
+    *,
+    timestamp_col: str = "timestamp",
+    ticker_col: str = "ticker",
+) -> pd.DataFrame:
+    """Long-form primary predictions → wide-merge в df.
+
+    ``df`` имеет DatetimeIndex и колонку ``ticker``.
+    ``primary_long`` имеет колонки ``[timestamp, ticker, horizon, mean]``
+    (формат :meth:`LightGBMPipeline.predict`).
+
+    Возвращает копию ``df`` с добавленными ``primary_h{h}`` колонками.
+    Для строк без матча — NaN.
+    """
+    if primary_long.empty:
+        out = df.copy()
+        for h in horizons:
+            out[f"primary_h{h}"] = np.nan
+        return out
+    primary_wide = primary_long.pivot_table(
+        index=[timestamp_col, ticker_col], columns="horizon", values="mean",
+    ).reset_index()
+    primary_wide.columns = [
+        timestamp_col, ticker_col,
+        *[f"primary_h{int(h)}" for h in primary_wide.columns[2:]],
+    ]
+    primary_wide[timestamp_col] = pd.to_datetime(
+        primary_wide[timestamp_col], utc=True,
+    )
+    df_reset = df.reset_index()
+    if "begin" in df_reset.columns:
+        df_reset = df_reset.rename(columns={"begin": timestamp_col})
+    elif df_reset.columns[0] != timestamp_col:
+        df_reset = df_reset.rename(columns={df_reset.columns[0]: timestamp_col})
+    df_reset[timestamp_col] = pd.to_datetime(df_reset[timestamp_col], utc=True)
+    merged = df_reset.merge(
+        primary_wide, on=[timestamp_col, ticker_col], how="left",
+    )
+    return merged.set_index(timestamp_col)
+
+
+# ---------------------------------------------------------------------------
+# High-level pipeline
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetaLabelingPipeline:
+    """Two-stage tree-based pipeline: Primary + Meta.
+
+    После fit'а имеет два LightGBMPipeline объекта (primary, meta).
+    Predict возвращает оба набора предсказаний. Стратегия использует
+    их вместе: trade if primary > T1 AND meta > T2.
+    """
+
+    horizons: tuple[int, ...]
+    primary_features: list[str]
+    meta_features: list[str]
+    primary_cfg: LightGBMConfig
+    meta_cfg: LightGBMConfig
+    cost_per_trade: float = 0.001
+    profit_multiplier: float = 2.0
+    n_oof_splits: int = 5
+
+    primary: LightGBMPipeline | None = None
+    meta: LightGBMPipeline | None = None
+
+    def fit(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+    ) -> dict[str, dict]:
+        """Train Primary (full train) + Meta (на OOF train + val).
+
+        Возвращает summary: {primary: {...}, meta: {...}} с per-horizon
+        метриками для отчёта.
+        """
+        # Step 1: OOF predictions for primary (для обучения meta)
+        logger.info("Step 1: Computing primary OOF on train (%d rows, %d folds)",
+                    len(train_df), self.n_oof_splits)
+        oof = compute_lgbm_oof_per_horizon(
+            train_df, self.primary_features, self.horizons,
+            cfg=self.primary_cfg, n_splits=self.n_oof_splits,
+        )
+
+        # Step 2: Train final Primary on full train (для inference)
+        logger.info("Step 2: Training final Primary on full train")
+        self.primary = LightGBMPipeline(
+            horizons=self.horizons,
+            feature_cols=self.primary_features,
+            cfg=self.primary_cfg,
+        )
+        self.primary.fit(train_df, val_df)
+
+        # Step 3: Build meta train dataset
+        logger.info("Step 3: Building meta train (OOF + meta targets)")
+        meta_train = train_df.copy()
+        for h in self.horizons:
+            meta_train[f"primary_h{h}"] = oof[f"primary_h{h}"]
+        meta_train = build_meta_targets(
+            meta_train, self.horizons,
+            cost_per_trade=self.cost_per_trade,
+            profit_multiplier=self.profit_multiplier,
+        )
+        # Переименовать meta_target_h{h} → target_h{h} для LightGBMPipeline
+        rename_map = {
+            f"meta_target_h{h}": f"target_h{h}" for h in self.horizons
+        }
+        # Сохраняем оригинальный target отдельно (нам нужны meta-targets)
+        meta_train_for_pipeline = meta_train.copy()
+        for h in self.horizons:
+            # Стираем primary-target и заменяем на meta-target для pipeline
+            meta_train_for_pipeline[f"target_h{h}"] = meta_train[f"meta_target_h{h}"]
+
+        # Step 4: Build meta val dataset
+        logger.info("Step 4: Building meta val (using final Primary preds)")
+        val_primary_preds = self.primary.predict(val_df)
+        meta_val = add_primary_predictions_wide(
+            val_df, val_primary_preds, self.horizons,
+        )
+        meta_val = build_meta_targets(
+            meta_val, self.horizons,
+            cost_per_trade=self.cost_per_trade,
+            profit_multiplier=self.profit_multiplier,
+        )
+        meta_val_for_pipeline = meta_val.copy()
+        for h in self.horizons:
+            meta_val_for_pipeline[f"target_h{h}"] = meta_val[f"meta_target_h{h}"]
+
+        # Step 5: Train Meta
+        logger.info("Step 5: Training Meta on OOF train + val (%d feats)",
+                    len(self.meta_features))
+        # Drop rows with NaN OOF (первые 1/(n+1) баров)
+        train_mask = meta_train_for_pipeline[
+            [f"primary_h{h}" for h in self.horizons]
+        ].notna().all(axis=1)
+        meta_train_clean = meta_train_for_pipeline[train_mask]
+        logger.info("  Meta train after OOF NaN drop: %d rows", len(meta_train_clean))
+        self.meta = LightGBMPipeline(
+            horizons=self.horizons,
+            feature_cols=self.meta_features,
+            cfg=self.meta_cfg,
+        )
+        self.meta.fit(meta_train_clean, meta_val_for_pipeline)
+
+        # Build summary
+        summary = {
+            "primary": {
+                h: {
+                    "best_iter": r.best_iteration,
+                    "val_log_loss": r.val_log_loss,
+                    "val_auc": r.val_auc,
+                }
+                for h, r in self.primary.models.items()
+            },
+            "meta": {
+                h: {
+                    "best_iter": r.best_iteration,
+                    "val_log_loss": r.val_log_loss,
+                    "val_auc": r.val_auc,
+                }
+                for h, r in self.meta.models.items()
+            },
+        }
+        return summary
+
+    def predict(self, df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Сделать предсказания обеих моделей.
+
+        Возвращает (primary_long, meta_long) — оба в long-form
+        (timestamp, ticker, horizon, mean, std), как у :meth:`LightGBMPipeline.predict`.
+        """
+        if self.primary is None or self.meta is None:
+            msg = "fit() not called yet"
+            raise RuntimeError(msg)
+        primary_preds = self.primary.predict(df)
+        # Build meta features by adding primary preds wide
+        df_with_primary = add_primary_predictions_wide(
+            df, primary_preds, self.horizons,
+        )
+        # Replace ticker column (lost in reset_index)
+        meta_preds = self.meta.predict(df_with_primary)
+        return primary_preds, meta_preds
+
+
+__all__ = [
+    "MetaLabelingPipeline",
+    "add_primary_predictions_wide",
+    "build_meta_targets",
+    "compute_lgbm_oof_per_horizon",
+]
