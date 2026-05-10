@@ -349,9 +349,122 @@ class MetaLabelingPipeline:
         return primary_preds, meta_preds
 
 
+def _merge_primary_meta_lr(
+    val_primary: pd.DataFrame,
+    val_meta: pd.DataFrame,
+    val_lr_targets: pd.DataFrame,
+    horizon: int,
+) -> pd.DataFrame:
+    """Merge primary + meta + lr per (timestamp, ticker) на одном горизонте."""
+    h_prim = val_primary[val_primary["horizon"] == horizon][
+        ["timestamp", "ticker", "horizon", "mean"]
+    ].rename(columns={"mean": "primary"})
+    h_meta = val_meta[val_meta["horizon"] == horizon][
+        ["timestamp", "ticker", "horizon", "mean"]
+    ].rename(columns={"mean": "meta"})
+    h_lr = val_lr_targets[val_lr_targets["horizon"] == horizon][
+        ["timestamp", "ticker", "horizon", "actual"]
+    ].rename(columns={"actual": "lr"})
+    if h_prim.empty or h_meta.empty or h_lr.empty:
+        return pd.DataFrame()
+    return h_prim.merge(
+        h_meta, on=["timestamp", "ticker", "horizon"], how="inner",
+    ).merge(h_lr, on=["timestamp", "ticker", "horizon"], how="inner")
+
+
+def _evaluate_threshold_pair(
+    merged: pd.DataFrame,
+    T_prim: float,
+    T_meta_abs: float,
+    pct: float,
+    cost_per_trade: float,
+) -> dict:
+    """Применить (T_prim, T_meta_abs) к merged val и вернуть метрики."""
+    mask = (merged["primary"] > T_prim) & (merged["meta"] > T_meta_abs)
+    n = int(mask.sum())
+    if n == 0:
+        return {
+            "T_prim": T_prim, "meta_pct": pct, "T_meta_abs": T_meta_abs,
+            "n_trades": 0, "mean_pnl": float("nan"),
+        }
+    mean_pnl = float(merged.loc[mask, "lr"].mean() - cost_per_trade)
+    return {
+        "T_prim": T_prim, "meta_pct": pct, "T_meta_abs": T_meta_abs,
+        "n_trades": n, "mean_pnl": mean_pnl,
+    }
+
+
+def joint_max_pnl_thresholds(
+    val_primary: pd.DataFrame,
+    val_meta: pd.DataFrame,
+    val_lr_targets: pd.DataFrame,
+    horizon: int,
+    *,
+    primary_thresholds: tuple[float, ...] = (0.45, 0.50, 0.55, 0.60, 0.65),
+    meta_percentiles: tuple[float, ...] = (5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0),
+    cost_per_trade: float = 0.001,
+    min_trades: int = 50,
+) -> tuple[float, float, list[dict]]:
+    """Найти (T_prim, T_meta) maximizing mean(lr - cost) on val для horizon.
+
+    **Sprint 1.5 fix**: meta-distribution не достигает абсолютного 0.5 на
+    коротких горизонтах (для h=6 mean meta = 0.157). Поэтому T_meta задаём
+    через **percentile** val-meta-распределения. T_meta_pct=10 значит
+    «топ-10% самых уверенных meta-предсказаний», что **гарантирует**
+    непустой n_buy на любом горизонте.
+
+    Возвращает (best_T_prim, best_T_meta_abs, sweep_table). T_meta_abs —
+    абсолютный порог, рассчитанный из val-meta-распределения.
+
+    ``min_trades`` — минимальное число сделок на val для валидной точки.
+    Если нет ни одной комбинации с min_trades — fallback к лучшей по PnL.
+    """
+    merged = _merge_primary_meta_lr(
+        val_primary, val_meta, val_lr_targets, horizon,
+    )
+    if merged.empty:
+        return float(primary_thresholds[0]), float("nan"), []
+
+    sweep: list[dict] = []
+    best_idx = None
+    best_pnl = -np.inf
+    fallback_idx = None
+    fallback_pnl = -np.inf
+    for T_prim in primary_thresholds:
+        for pct in meta_percentiles:
+            T_meta_abs = float(np.percentile(merged["meta"], 100.0 - pct))
+            row = _evaluate_threshold_pair(
+                merged, T_prim, T_meta_abs, pct, cost_per_trade,
+            )
+            sweep.append(row)
+            pnl = row["mean_pnl"]
+            if not np.isfinite(pnl):
+                continue
+            if pnl > fallback_pnl:
+                fallback_pnl = pnl
+                fallback_idx = len(sweep) - 1
+            if row["n_trades"] >= min_trades and pnl > best_pnl:
+                best_pnl = pnl
+                best_idx = len(sweep) - 1
+
+    if best_idx is None:
+        if fallback_idx is None:
+            return float(primary_thresholds[0]), float("nan"), sweep
+        chosen = sweep[fallback_idx]
+        logger.warning(
+            "joint_max_pnl: нет комбинаций >= %d trades, fallback к best PnL: "
+            "T_prim=%.3f, T_meta=%.3f",
+            min_trades, chosen["T_prim"], chosen["T_meta_abs"],
+        )
+        return float(chosen["T_prim"]), float(chosen["T_meta_abs"]), sweep
+    chosen = sweep[best_idx]
+    return float(chosen["T_prim"]), float(chosen["T_meta_abs"]), sweep
+
+
 __all__ = [
     "MetaLabelingPipeline",
     "add_primary_predictions_wide",
     "build_meta_targets",
     "compute_lgbm_oof_per_horizon",
+    "joint_max_pnl_thresholds",
 ]
