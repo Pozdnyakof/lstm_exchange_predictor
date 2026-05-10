@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Callable
 
 import lightgbm as lgb
 import numpy as np
@@ -80,36 +79,61 @@ def compute_lgbm_oof_per_horizon(
     """
     if cfg is None:
         cfg = LightGBMConfig()
-    out = pd.DataFrame(index=train_df.index)
-    for h in horizons:
-        out[f"primary_h{h}"] = np.nan
-
     n = len(train_df)
+    # Используем numpy-массивы для записи по позициям. ``out.loc[idx, col] = ...``
+    # ломается на multi-ticker DataFrame: один timestamp матчит несколько
+    # строк (по одной на тикер), и broadcast'инг скаляра/массива на N×k
+    # позиций даёт length mismatch.
+    out_arrays: dict[str, np.ndarray] = {
+        f"primary_h{h}": np.full(n, np.nan, dtype=np.float32)
+        for h in horizons
+    }
+
     tscv = TimeSeriesSplit(n_splits=n_splits)
     for fold_idx, (tr_idx, te_idx) in enumerate(tscv.split(np.arange(n))):
         tr_sub = train_df.iloc[tr_idx]
         te_sub = train_df.iloc[te_idx]
         for h in horizons:
-            target_col = f"target_h{h}"
-            if target_col not in tr_sub.columns:
-                continue
-            mask_tr = tr_sub[target_col].notna()
-            mask_te = te_sub[target_col].notna()
-            if not mask_tr.any() or not mask_te.any():
-                continue
-            X_tr = tr_sub.loc[mask_tr, feature_cols]
-            y_tr = tr_sub.loc[mask_tr, target_col].astype(int).to_numpy()
-            X_te = te_sub.loc[mask_te, feature_cols]
-            model = lgb.LGBMClassifier(**cfg.to_lgb_params())
-            model.fit(X_tr, y_tr)
-            preds = model.predict_proba(X_te)[:, 1]
-            preds_idx = te_sub.loc[mask_te].index
-            out.loc[preds_idx, f"primary_h{h}"] = preds.astype(np.float32)
+            _fit_oof_one_fold_horizon(
+                tr_sub, te_sub, te_idx, h, feature_cols, cfg,
+                out_arrays[f"primary_h{h}"],
+            )
         logger.info(
             "OOF fold %d/%d done (train=%d, test=%d)",
             fold_idx + 1, n_splits, len(tr_sub), len(te_sub),
         )
-    return out
+    # Собираем итоговый DataFrame с СОХРАНЕНИЕМ оригинального индекса
+    # (чтобы downstream код мог join'ить по timestamp+ticker).
+    return pd.DataFrame(out_arrays, index=train_df.index)
+
+
+def _fit_oof_one_fold_horizon(
+    tr_sub: pd.DataFrame,
+    te_sub: pd.DataFrame,
+    te_positions: np.ndarray,
+    horizon: int,
+    feature_cols: list[str],
+    cfg: LightGBMConfig,
+    out_buffer: np.ndarray,
+) -> None:
+    """Обучить LGBM на tr_sub, предсказать на te_sub, записать в out_buffer
+    по позициям te_positions[mask_te]."""
+    target_col = f"target_h{horizon}"
+    if target_col not in tr_sub.columns:
+        return
+    mask_tr = tr_sub[target_col].notna().to_numpy()
+    mask_te = te_sub[target_col].notna().to_numpy()
+    if not mask_tr.any() or not mask_te.any():
+        return
+    # .iloc безопасен на дубликатах индекса (multi-ticker), .loc нет.
+    X_tr = tr_sub.iloc[mask_tr][feature_cols]
+    y_tr = tr_sub.iloc[mask_tr][target_col].astype(int).to_numpy()
+    X_te = te_sub.iloc[mask_te][feature_cols]
+    model = lgb.LGBMClassifier(**cfg.to_lgb_params())
+    model.fit(X_tr, y_tr)
+    preds = model.predict_proba(X_te)[:, 1]
+    positions_in_full = te_positions[mask_te]
+    out_buffer[positions_in_full] = preds.astype(np.float32)
 
 
 def build_meta_targets(
@@ -247,14 +271,11 @@ class MetaLabelingPipeline:
             cost_per_trade=self.cost_per_trade,
             profit_multiplier=self.profit_multiplier,
         )
-        # Переименовать meta_target_h{h} → target_h{h} для LightGBMPipeline
-        rename_map = {
-            f"meta_target_h{h}": f"target_h{h}" for h in self.horizons
-        }
-        # Сохраняем оригинальный target отдельно (нам нужны meta-targets)
+        # Подменяем target_h{h} на meta_target_h{h} — LightGBMPipeline
+        # ожидает target_h{h} для обучения, нам надо чтобы он учил
+        # meta-задачу (прибыльность сделки), а не direction.
         meta_train_for_pipeline = meta_train.copy()
         for h in self.horizons:
-            # Стираем primary-target и заменяем на meta-target для pipeline
             meta_train_for_pipeline[f"target_h{h}"] = meta_train[f"meta_target_h{h}"]
 
         # Step 4: Build meta val dataset
